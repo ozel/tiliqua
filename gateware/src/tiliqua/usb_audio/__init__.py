@@ -34,6 +34,7 @@ from tiliqua.periph import eurorack_pmod
 
 from .audio_to_channels import AudioToChannels
 from .channels_to_usb_stream import ChannelsToUSBStream
+from .sw_pll import SwPLL
 from .usb_stream_to_channels import USBStreamToChannels
 from .util import EdgeToPulse
 
@@ -56,17 +57,24 @@ class USB2AudioInterface(wiring.Component):
 
     """ USB Audio Class v2 interface """
 
-    def __init__(self, *, audio_clock: pll.AudioClock, nr_channels):
+    def __init__(self, *, audio_clock: pll.AudioClock, nr_channels, sync_mode="async"):
         self.fs = 192000 if audio_clock.is_192khz() else 48000
         self.nr_channels = nr_channels
+        self.sync_mode = sync_mode
         self.max_packet_size = int(32 * (self.fs // 48000) * self.nr_channels)
-        super().__init__({
+        if sync_mode == "adaptive" and self.fs != 48000:
+            raise ValueError("adaptive sync mode only supported for 48kHz")
+        sig = {
             "i":  In(stream.Signature(data.ArrayLayout(eurorack_pmod.ASQ, self.nr_channels))),
             "o": Out(stream.Signature(data.ArrayLayout(eurorack_pmod.ASQ, self.nr_channels))),
             "usb_connect": In(1, init=1),
-
-            "dbg": Out(self.DebugInterface())
-        })
+            "dbg": Out(self.DebugInterface()),
+        }
+        if sync_mode == "adaptive":
+            # Recovered audio clock output for platform clock domain override
+            sig["mclk_out"] = Out(1)
+            sig["sw_pll_locked"] = Out(1)
+        super().__init__(sig)
 
     def create_descriptors(self):
         """ Creates the descriptors that describe our audio topology. """
@@ -161,11 +169,13 @@ class USB2AudioInterface(wiring.Component):
 
 
     def create_output_streaming_interface(self, c, *, nr_channels, alt_setting_nr):
+        adaptive = self.sync_mode == "adaptive"
+
         # Interface Descriptor (Streaming, OUT, active setting)
         activeAudioStreamingInterface                   = uac2.AudioStreamingInterfaceDescriptorEmitter()
         activeAudioStreamingInterface.bInterfaceNumber  = 1
         activeAudioStreamingInterface.bAlternateSetting = alt_setting_nr
-        activeAudioStreamingInterface.bNumEndpoints     = 2
+        activeAudioStreamingInterface.bNumEndpoints     = 1 if adaptive else 2
         c.add_subordinate_descriptor(activeAudioStreamingInterface)
 
         # AudioStreaming Interface Descriptor (General)
@@ -183,10 +193,11 @@ class USB2AudioInterface(wiring.Component):
         c.add_subordinate_descriptor(typeIStreamingInterface)
 
         # Endpoint Descriptor (Audio out)
+        sync_type = USBSynchronizationType.ADAPTIVE if adaptive else USBSynchronizationType.ASYNC
         audioOutEndpoint = standard.EndpointDescriptorEmitter()
         audioOutEndpoint.bEndpointAddress     = USBDirection.OUT.to_endpoint_address(1) # EP 1 OUT
         audioOutEndpoint.bmAttributes         = USBTransferType.ISOCHRONOUS  | \
-                                                (USBSynchronizationType.ASYNC << 2) | \
+                                                (sync_type << 2) | \
                                                 (USBUsageType.DATA << 4)
         audioOutEndpoint.wMaxPacketSize = self.max_packet_size
         audioOutEndpoint.bInterval       = 1
@@ -196,15 +207,16 @@ class USB2AudioInterface(wiring.Component):
         audioControlEndpoint = uac2.ClassSpecificAudioStreamingIsochronousAudioDataEndpointDescriptorEmitter()
         c.add_subordinate_descriptor(audioControlEndpoint)
 
-        # Endpoint Descriptor (Feedback IN)
-        feedbackInEndpoint = standard.EndpointDescriptorEmitter()
-        feedbackInEndpoint.bEndpointAddress  = USBDirection.IN.to_endpoint_address(1) # EP 1 IN
-        feedbackInEndpoint.bmAttributes      = USBTransferType.ISOCHRONOUS  | \
-                                               (USBSynchronizationType.NONE << 2)  | \
-                                               (USBUsageType.FEEDBACK << 4)
-        feedbackInEndpoint.wMaxPacketSize    = 4
-        feedbackInEndpoint.bInterval         = 4
-        c.add_subordinate_descriptor(feedbackInEndpoint)
+        if not adaptive:
+            # Endpoint Descriptor (Feedback IN) - only for async mode
+            feedbackInEndpoint = standard.EndpointDescriptorEmitter()
+            feedbackInEndpoint.bEndpointAddress  = USBDirection.IN.to_endpoint_address(1) # EP 1 IN
+            feedbackInEndpoint.bmAttributes      = USBTransferType.ISOCHRONOUS  | \
+                                                   (USBSynchronizationType.NONE << 2)  | \
+                                                   (USBUsageType.FEEDBACK << 4)
+            feedbackInEndpoint.wMaxPacketSize    = 4
+            feedbackInEndpoint.bInterval         = 4
+            c.add_subordinate_descriptor(feedbackInEndpoint)
 
 
     def create_output_channels_descriptor(self, c):
@@ -245,15 +257,16 @@ class USB2AudioInterface(wiring.Component):
         typeIStreamingInterface.bBitResolution = 24 # we use all 24 bits
         c.add_subordinate_descriptor(typeIStreamingInterface)
 
-        # Endpoint Descriptor (Audio out)
-        audioOutEndpoint = standard.EndpointDescriptorEmitter()
-        audioOutEndpoint.bEndpointAddress     = USBDirection.IN.to_endpoint_address(2) # EP 2 IN
-        audioOutEndpoint.bmAttributes         = USBTransferType.ISOCHRONOUS  | \
-                                                (USBSynchronizationType.ASYNC << 2) | \
+        # Endpoint Descriptor (Audio in)
+        sync_type = USBSynchronizationType.ADAPTIVE if self.sync_mode == "adaptive" else USBSynchronizationType.ASYNC
+        audioInEndpoint = standard.EndpointDescriptorEmitter()
+        audioInEndpoint.bEndpointAddress     = USBDirection.IN.to_endpoint_address(2) # EP 2 IN
+        audioInEndpoint.bmAttributes         = USBTransferType.ISOCHRONOUS  | \
+                                                (sync_type << 2) | \
                                                 (USBUsageType.DATA << 4)
-        audioOutEndpoint.wMaxPacketSize = self.max_packet_size
-        audioOutEndpoint.bInterval      = 1
-        c.add_subordinate_descriptor(audioOutEndpoint)
+        audioInEndpoint.wMaxPacketSize = self.max_packet_size
+        audioInEndpoint.bInterval      = 1
+        c.add_subordinate_descriptor(audioInEndpoint)
 
         # AudioControl Endpoint Descriptor
         audioControlEndpoint = uac2.ClassSpecificAudioStreamingIsochronousAudioDataEndpointDescriptorEmitter()
@@ -302,10 +315,12 @@ class USB2AudioInterface(wiring.Component):
             max_packet_size=self.max_packet_size)
         usb.add_endpoint(ep1_out)
 
-        ep1_in = USBIsochronousInEndpoint(
-            endpoint_number=1, # EP 1 IN
-            max_packet_size=4)
-        usb.add_endpoint(ep1_in)
+        if self.sync_mode != "adaptive":
+            # Feedback endpoint only needed for async mode
+            ep1_in = USBIsochronousInEndpoint(
+                endpoint_number=1, # EP 1 IN
+                max_packet_size=4)
+            usb.add_endpoint(ep1_in)
 
         ep2_in = USBIsochronousStreamInEndpoint(
             endpoint_number=2, # EP 2 IN
@@ -331,50 +346,12 @@ class USB2AudioInterface(wiring.Component):
         # Connect our device as a high speed device
         m.submodules.usb_connect_ffsync = FFSynchronizer(self.usb_connect, usb.connect, o_domain="usb", init=0)
         m.d.comb += [
-            ep1_in.bytes_in_frame.eq(4),
             ep2_in.bytes_in_frame.eq(audio_in_frame_bytes),
             usb.full_speed_only  .eq(0),
         ]
 
-        # feedback endpoint
-        feedbackValue      = Signal(32, reset=0x60000)
-        bitPos             = Signal(5)
-
-        # this tracks the number of audio frames since the last USB frame
-        # 12.288MHz / 8kHz = 1536, so we need at least 11 bits = 2048
-        # we need to capture 32 micro frames to get to the precision
-        # required by the USB standard, so and that is 0xc000, so we
-        # need 16 bits here
-        audio_clock_counter = Signal(24)
-        sof_counter         = Signal(8)
-        audio_clock_usb = Signal()
-        m.submodules.audio_clock_usb_pulse = audio_clock_usb_pulse = DomainRenamer("usb")(EdgeToPulse())
-        audio_clock_tick = Signal()
-        m.d.usb += [
-            audio_clock_usb_pulse.edge_in.eq(audio_clock_usb),
-            audio_clock_tick.eq(audio_clock_usb_pulse.pulse_out),
-        ]
-
-        match self.fs:
-            case 192000:
-                # Audio clock dangerously close to USB clock, divide it down before synchronizing into USB domain
-                audio_clkdiv = Signal(2)
-                m.d.audio += audio_clkdiv.eq(audio_clkdiv+1)
-                m.submodules.audio_clock_usb_sync = FFSynchronizer(audio_clkdiv[-1], audio_clock_usb, o_domain="usb")
-                with m.If(audio_clock_tick):
-                    m.d.usb += audio_clock_counter.eq(audio_clock_counter + 4)
-            case 48000:
-                # Audio clock not close to USB clock, no need for divider.
-                m.submodules.audio_clock_usb_sync = FFSynchronizer(ClockSignal("audio"), audio_clock_usb, o_domain="usb")
-                with m.If(audio_clock_tick):
-                    m.d.usb += audio_clock_counter.eq(audio_clock_counter + 1)
-            case _:
-                raise ValueError("audio clock tracking only tested for 48khz/192khz")
-
-        m.d.comb += [
-            bitPos.eq(ep1_in.address << 3),
-            ep1_in.value.eq(0xff & (feedbackValue >> bitPos)),
-        ]
+        if self.sync_mode != "adaptive":
+            m.d.comb += ep1_in.bytes_in_frame.eq(4)
 
         m.submodules.usb_to_channel_stream = usb_to_channel_stream = \
             DomainRenamer("usb")(USBStreamToChannels(self.nr_channels))
@@ -398,8 +375,6 @@ class USB2AudioInterface(wiring.Component):
 
             return audio_in_active
 
-            usb_audio_in_active  = detect_active_audio_in(m, "usb", usb, ep2_in)
-
         usb_audio_in_active = detect_active_audio_in(m, "usb", usb, ep2_in)
 
         wiring.connect(m, wiring.flipped(usb_to_channel_stream.usb_stream_in), ep1_out.stream)
@@ -421,23 +396,90 @@ class USB2AudioInterface(wiring.Component):
         wiring.connect(m, wiring.flipped(self.i), audio_to_channels.i)
         wiring.connect(m, audio_to_channels.o, wiring.flipped(self.o))
 
-        with m.If(usb.sof_detected):
-            m.d.usb += sof_counter.eq(sof_counter + 1)
+        if self.sync_mode == "adaptive":
+            # --- Adaptive mode: Software PLL generates audio clock ---
+            # The SW PLL NCO runs in the USB domain and generates a recovered
+            # audio clock that tracks the host's SOF timing.
+            m.submodules.sw_pll = sw_pll = DomainRenamer("usb")(SwPLL(
+                ref_freq=60_000_000,
+                target_freq=12_288_000,
+                sof_accumulation=32,
+            ))
+            m.d.comb += [
+                sw_pll.sof_detected.eq(usb.sof_detected),
+                # In adaptive mode, we measure the NCO's own output to close
+                # the loop. The audio_clock_tick comes from the NCO output
+                # edges detected via EdgeToPulse.
+            ]
+            # Synchronize NCO mclk_out into USB domain for self-measurement
+            nco_edge_pulse = DomainRenamer("usb")(EdgeToPulse())
+            m.submodules.nco_edge_pulse = nco_edge_pulse
+            m.d.usb += nco_edge_pulse.edge_in.eq(sw_pll.mclk_out)
+            m.d.comb += sw_pll.audio_clock_tick.eq(nco_edge_pulse.pulse_out)
 
-            # according to USB2 standard chapter 5.12.4.2
-            # we need 2**13 / 2**8 = 2**5 = 32 SOF-frames of
-            # sample master frequency counter to get enough
-            # precision for the sample frequency estimate
-            # / 2**8 because the ADAT-clock = 256 times = 2**8
-            # the sample frequency and sof_counter is 5 bits
-            # so it wraps automatically every 32 SOFs
-            with m.If(sof_counter == 0):
-                m.d.usb += [
-                    # FIFO feedback?
-                    feedbackValue.eq((audio_clock_counter + 1) -
-                                     (audio_to_channels.dac_fifo_level >> 3)),
-                    audio_clock_counter.eq(0),
-                ]
+            # Export recovered clock and lock status
+            m.d.comb += [
+                self.mclk_out.eq(sw_pll.mclk_out),
+                self.sw_pll_locked.eq(sw_pll.locked),
+            ]
+        else:
+            # --- Async mode: Feedback endpoint tells host our clock rate ---
+            feedbackValue      = Signal(32, reset=0x60000)
+            bitPos             = Signal(5)
+
+            # this tracks the number of audio frames since the last USB frame
+            # 12.288MHz / 8kHz = 1536, so we need at least 11 bits = 2048
+            # we need to capture 32 micro frames to get to the precision
+            # required by the USB standard, so and that is 0xc000, so we
+            # need 16 bits here
+            audio_clock_counter = Signal(24)
+            sof_counter         = Signal(8)
+            audio_clock_usb = Signal()
+            m.submodules.audio_clock_usb_pulse = audio_clock_usb_pulse = DomainRenamer("usb")(EdgeToPulse())
+            audio_clock_tick = Signal()
+            m.d.usb += [
+                audio_clock_usb_pulse.edge_in.eq(audio_clock_usb),
+                audio_clock_tick.eq(audio_clock_usb_pulse.pulse_out),
+            ]
+
+            match self.fs:
+                case 192000:
+                    # Audio clock dangerously close to USB clock, divide it down before synchronizing into USB domain
+                    audio_clkdiv = Signal(2)
+                    m.d.audio += audio_clkdiv.eq(audio_clkdiv+1)
+                    m.submodules.audio_clock_usb_sync = FFSynchronizer(audio_clkdiv[-1], audio_clock_usb, o_domain="usb")
+                    with m.If(audio_clock_tick):
+                        m.d.usb += audio_clock_counter.eq(audio_clock_counter + 4)
+                case 48000:
+                    # Audio clock not close to USB clock, no need for divider.
+                    m.submodules.audio_clock_usb_sync = FFSynchronizer(ClockSignal("audio"), audio_clock_usb, o_domain="usb")
+                    with m.If(audio_clock_tick):
+                        m.d.usb += audio_clock_counter.eq(audio_clock_counter + 1)
+                case _:
+                    raise ValueError("audio clock tracking only tested for 48khz/192khz")
+
+            m.d.comb += [
+                bitPos.eq(ep1_in.address << 3),
+                ep1_in.value.eq(0xff & (feedbackValue >> bitPos)),
+            ]
+
+            with m.If(usb.sof_detected):
+                m.d.usb += sof_counter.eq(sof_counter + 1)
+
+                # according to USB2 standard chapter 5.12.4.2
+                # we need 2**13 / 2**8 = 2**5 = 32 SOF-frames of
+                # sample master frequency counter to get enough
+                # precision for the sample frequency estimate
+                # / 2**8 because the ADAT-clock = 256 times = 2**8
+                # the sample frequency and sof_counter is 5 bits
+                # so it wraps automatically every 32 SOFs
+                with m.If(sof_counter == 0):
+                    m.d.usb += [
+                        # FIFO feedback?
+                        feedbackValue.eq((audio_clock_counter + 1) -
+                                         (audio_to_channels.dac_fifo_level >> 3)),
+                        audio_clock_counter.eq(0),
+                    ]
 
         # Debug interface for introspection / ILA usage
         m.d.comb += [

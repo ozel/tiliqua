@@ -7,7 +7,7 @@ Enumerates as a 4-in, 4-out 48kHz sound card.
 from amaranth import *
 from amaranth.lib import cdc, wiring
 
-from tiliqua import usb_audio
+from tiliqua import pll, usb_audio
 from tiliqua.build.cli import top_level_cli
 from tiliqua.periph import eurorack_pmod
 from tiliqua.build.types import BitstreamHelp
@@ -23,9 +23,10 @@ class USBAudioTop(Elaboratable):
         io_right=['', 'USB audio device', '', '', '', '']
     )
 
-    def __init__(self, clock_settings):
+    def __init__(self, clock_settings, sync_mode="async"):
         super().__init__()
         self.clock_settings = clock_settings
+        self.sync_mode = sync_mode
 
     def elaborate(self, platform):
         m = Module()
@@ -41,10 +42,20 @@ class USBAudioTop(Elaboratable):
         m.d.comb += pmod0.codec_mute.eq(reboot.mute)
 
         m.submodules.usbif = usbif = usb_audio.USB2AudioInterface(
-                audio_clock=self.clock_settings.audio_clock, nr_channels=4)
+                audio_clock=self.clock_settings.audio_clock, nr_channels=4,
+                sync_mode=self.sync_mode)
 
         wiring.connect(m, pmod0.o_cal, usbif.i)
         wiring.connect(m, usbif.o, pmod0.i_cal)
+
+        # In adaptive mode, wire up the SW PLL recovered clock
+        # to override the audio domain clock source.
+        if self.sync_mode == "adaptive":
+            if hasattr(car, 'audio_clock_override'):
+                m.d.comb += [
+                    car.audio_clock_override.eq(usbif.sw_pll_locked),
+                    car.audio_clock_override_clk.eq(usbif.mclk_out),
+                ]
 
         if platform.ila:
 
@@ -83,5 +94,19 @@ class USBAudioTop(Elaboratable):
 
         return m
 
+
+def add_adaptive_args(parser):
+    parser.add_argument('--adaptive', action='store_true',
+                        help="Use adaptive USB audio sync mode (device tracks host clock via SW PLL).")
+
+
+def parse_adaptive_args(args):
+    if args.adaptive and args.fs_192khz:
+        raise SystemExit("error: --adaptive is not supported with --fs-192khz (192kHz mode)")
+    return {"sync_mode": "adaptive" if args.adaptive else "async"}
+
+
 if __name__ == "__main__":
-    top_level_cli(USBAudioTop, video_core=False, ila_supported=True)
+    top_level_cli(USBAudioTop, video_core=False, ila_supported=True,
+                  argparse_callback=add_adaptive_args,
+                  argparse_fragment=parse_adaptive_args)

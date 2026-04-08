@@ -303,6 +303,11 @@ class TiliquaDomainGeneratorPLLExternal(Elaboratable):
         super().__init__()
         self.reset_dvi_pll = Signal(init=0)
         self.settings = settings
+        # Adaptive USB audio clock override: when asserted, the audio domain
+        # is driven by audio_clock_override_clk (from SW PLL NCO) instead of
+        # the SI5351A external PLL output.
+        self.audio_clock_override = Signal(init=0)
+        self.audio_clock_override_clk = Signal()
 
     def prettyprint(self):
         print(textwrap.dedent(self.clock_tree_base).format(
@@ -358,13 +363,30 @@ class TiliquaDomainGeneratorPLLExternal(Elaboratable):
 
         # Generate synchronous reset for audio domain (there is no internal
         # PLL between the external PLL clock and the audio domain).
+
+        # Select audio clock source: SI5351A external PLL (default) or
+        # SW PLL NCO output (adaptive USB audio mode).
+        audio_clk_selected = Signal()
+        with m.If(self.audio_clock_override):
+            # Route SW PLL NCO output through DCCA global clock buffer
+            # for low-skew distribution across the FPGA fabric.
+            audio_clk_buffered = Signal()
+            m.submodules.audio_dcca = Instance("DCCA",
+                i_CLKI=self.audio_clock_override_clk,
+                i_CE=1,
+                o_CLKO=audio_clk_buffered,
+            )
+            m.d.comb += audio_clk_selected.eq(audio_clk_buffered)
+        with m.Else():
+            m.d.comb += audio_clk_selected.eq(ClockSignal("expll_clk0"))
+
         m.submodules.clock_monitor = clock_monitor = ClockStabilityMonitor(
             monitor_domain="sync",
             target_domain="expll_clk0"
         )
         m.d.comb += [
-            clock_monitor.clk_in.eq(ClockSignal("expll_clk0")),
-            ClockSignal("audio").eq(clock_monitor.clk_in),
+            clock_monitor.clk_in.eq(audio_clk_selected),
+            ClockSignal("audio").eq(audio_clk_selected),
             ResetSignal("audio").eq(clock_monitor.reset_out),
         ]
 

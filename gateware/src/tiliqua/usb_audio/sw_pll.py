@@ -108,37 +108,34 @@ class SwPLL(wiring.Component):
         #   Positive error: audio clock is too slow, increase FCW
         #   Negative error: audio clock is too fast, decrease FCW
         #
-        # PI update:
-        #   fcw += (error >> kp_shift) + integrator_update
-        #   integrator += error >> ki_shift
+        # Standard PI form:
+        #   integrator += ki * error
+        #   output = nominal + kp * error + integrator
 
         expected = Signal(24, reset=self._expected_count)
-        error = Signal(signed(24))
+        error = Signal(signed(24))               # latched (for debug)
         integrator = Signal(signed(32))
 
-        with m.If(sof_counter.measurement_valid):
-            m.d.sync += error.eq(expected - sof_counter.measured_count)
-
-        # Apply correction one cycle after error is computed
-        # (to avoid long combinational path through subtraction + shift + add)
-        error_d1 = Signal(signed(24))
-        valid_d1 = Signal()
-        m.d.sync += [
-            error_d1.eq(error),
-            valid_d1.eq(sof_counter.measurement_valid),
-        ]
-
+        # Combinational PI math, latched on measurement strobe.
+        # At ~8 kHz SOF rate, the whole sub+shift+add path has microseconds
+        # of slack in the sync domain, so a single-cycle combinational path
+        # is fine here.
+        error_comb = Signal(signed(24))
         p_term = Signal(signed(32))
-        i_update = Signal(signed(32))
+        i_term_delta = Signal(signed(32))
+        new_integrator = Signal(signed(32))
         m.d.comb += [
-            p_term.eq(error_d1 >> self.kp_shift),
-            i_update.eq(error_d1 >> self.ki_shift),
+            error_comb.eq(expected - sof_counter.measured_count),
+            p_term.eq(error_comb >> self.kp_shift),
+            i_term_delta.eq(error_comb >> self.ki_shift),
+            new_integrator.eq(integrator + i_term_delta),
         ]
 
-        with m.If(valid_d1):
+        with m.If(sof_counter.measurement_valid):
             m.d.sync += [
-                integrator.eq(integrator + i_update),
-                fcw.eq(self._nominal_fcw + p_term + integrator + i_update),
+                error.eq(error_comb),
+                integrator.eq(new_integrator),
+                fcw.eq(self._nominal_fcw + p_term + new_integrator),
             ]
 
         # --- Outputs ---

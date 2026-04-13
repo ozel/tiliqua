@@ -41,12 +41,12 @@ class SOFCounterTests(unittest.TestCase):
                 # Emit SOF pulse
                 ctx.set(dut.sof_detected, 1)
                 await ctx.tick()
-                ctx.set(dut.sof_detected, 0)
-                await ctx.tick()
-
-                # Check for measurement
+                # measurement_valid is a one-cycle strobe: sample it here,
+                # before sof_detected goes low and drives it back to 0.
                 if ctx.get(dut.measurement_valid):
                     measurements.append(ctx.get(dut.measured_count))
+                ctx.set(dut.sof_detected, 0)
+                await ctx.tick()
 
         sim = Simulator(m)
         sim.add_clock(1e-6)

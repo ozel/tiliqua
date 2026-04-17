@@ -1128,6 +1128,14 @@ class CoreTop(Elaboratable):
             wiring.connect(m, serialrx.o, midi_decode.i)
             wiring.connect(m, midi_decode.o, self.core.i_midi)
 
+        if hasattr(self.core, "i_usb_midi") and sim.is_hw(platform):
+            # USB MIDI device mode: Tiliqua appears as a USB MIDI device
+            # to the host computer, receiving MIDI data from the host.
+            m.submodules.usb_midi_device = usb_midi_device = midi.USBMIDIDevice()
+            m.submodules.usb_midi_decode = usb_midi_decode = midi.MidiDecode(usb=True)
+            wiring.connect(m, usb_midi_device.o, usb_midi_decode.i)
+            wiring.connect(m, usb_midi_decode.o, self.core.i_usb_midi)
+
         if hasattr(self.core, "bus"):
             m.submodules.psram_periph = self.psram_periph
             wiring.connect(m, self.core.bus, self.psram_periph.bus)
@@ -1146,6 +1154,7 @@ CORES = {
     "touchmix":       (True,  TouchMixTop),
     "waveshaper":     (False, DualWaveshaper),
     "midicv":         (False, midi.MonoMidiCV),
+    "usbmidicv":      (False, midi.USBMonoMidiCV),
     "psram_pingpong": (False, PSRAMPingPongDelay),
     "sram_pingpong":  (False, SRAMPingPongDelay),
     "psram_diffuser": (False, PSRAMDiffuser),

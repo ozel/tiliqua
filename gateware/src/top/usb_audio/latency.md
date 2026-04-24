@@ -27,7 +27,8 @@ cable → AK4619 ADC → FPGA → USB host.
 | Audio-class sync mode | ASYNC isochronous w/ feedback EP | [gateware/src/tiliqua/usb_audio/__init__.py:188-207](gateware/src/tiliqua/usb_audio/__init__.py#L188-L207) |
 | Audio microframe interval | 125 µs | |
 | `dac_fifo` / `adc_fifo` depth | 16 samples each | [gateware/src/tiliqua/usb_audio/__init__.py:420](gateware/src/tiliqua/usb_audio/__init__.py#L420) |
-| FIFO target occupancy | ~half (8 samples) | [gateware/src/tiliqua/usb_audio/__init__.py:437](gateware/src/tiliqua/usb_audio/__init__.py#L437) |
+| DAC FIFO nominal target | ~half (8 samples); observed ~12 | [gateware/src/tiliqua/usb_audio/__init__.py:437](gateware/src/tiliqua/usb_audio/__init__.py#L437) |
+| ADC FIFO steady state | ~0–1 samples (no feedback on this side) | observed via LED bar |
 | Feedback update interval | every 32 SOFs (≈32 ms) | [gateware/src/tiliqua/usb_audio/__init__.py:434](gateware/src/tiliqua/usb_audio/__init__.py#L434) |
 | Codec | AK4619 on eurorack-pmod | — |
 
@@ -58,7 +59,7 @@ pw-jack jack_connect "Tiliqua Pro:capture_AUX0" jack_delay:in
 
 | quantum | total (fr) | total (ms) | PW graph (2×q) | extra (fr) | stability |
 |---:|---:|---:|---:|---:|---|
-|  32 |  115 |  2.40 |  64 | 51 | **marginal** — `Signal below threshold`, feedback hunting |
+|  32 |  115 |  2.40 |  64 | 51 | feedback-loop hunting visible (bimodal extra 39↔51) |
 |  64 |  168 |  3.50 | 128 | 40 | stable — **recommended for low-latency work** |
 | 128 |  293 |  6.11 | 256 | 37 | very stable |
 | 256 |  537 | 11.19 | 512 | 25 | very stable |
@@ -83,7 +84,7 @@ node (no resampling, no extra PW graph buffering).
   8 ┤
   6 ┤                  ●  q=128 (6.11)
   4 ┤            ●  q=64 (3.50)
-  2 ┤      ●  q=32 (2.40)  ← unstable
+  2 ┤      ●  q=32 (2.40)  ← feedback hunting
   0 ┼──────┬────────┬────────┬──────────────┬──────────────────────────●──
          32        64      128             256                         512
                           quantum (frames)
@@ -94,8 +95,8 @@ node (no resampling, no extra PW graph buffering).
 ```
  extra loopback (frames @ 48 kHz)
 
- 55 ┤  ●  q=32: 51 (feedback hunting +
- 50 ┤     |       URB floor visible)
+ 55 ┤  ●  q=32: 51 (DAC FIFO overshoots
+ 50 ┤     |       feedback setpoint)
  45 ┤     |
  40 ┤     |     ●  q=64: 40
  35 ┤     ╲     |     ●  q=128: 37
@@ -113,21 +114,96 @@ node (no resampling, no extra PW graph buffering).
 At `q ≥ 256` the hardware contribution plateaus at **~25 frames ≈
 520 µs** — the irreducible floor of the flashed design.
 
+## USB frame buffering — why it doesn't appear as a separate term
+
+USB 2.0 high-speed delivers one audio microframe every **125 µs** — at
+48 kHz that's **6 samples per channel per microframe**. So samples
+never arrive as a smooth flow; they arrive in burst-per-microframe on
+both the OUT (host → device) and IN (device → host) paths.
+
+### Host side
+
+| Layer | Where | Typical size |
+|---|---|---|
+| PipeWire ring (software) | userspace | 2 × quantum frames (reported as PW graph latency) |
+| ALSA PCM ring + snd-usb-audio URB queue | kernel | ≥ 2 URBs of ~1 ms each, sized by the driver |
+| USB host-controller DMA | xHCI/EHCI hardware | ≤ 1 microframe (~6 frames) ahead |
+
+`jack_iodelay`'s "extra loopback latency" is
+`total_measured − PipeWire_graph_claim`. The PipeWire graph claim
+already tracks the software ring size the driver is asked to maintain,
+so the kernel URB queue piggy-backs onto that same reservoir rather
+than stacking on top of it.
+
+### Gateware side (LUNA + usb_audio)
+
+On the device end there are **two microframe-scale buffers** sitting
+either side of the `audio_to_channels` FIFOs that are usually discussed
+as "the" FIFOs:
+
+| Path | Buffer | Depth | Source | Steady state |
+|---|---|---:|---|---:|
+| Playback (IN from host) | LUNA `USBIsochronousStreamOutEndpoint.fifo` | 2 × `max_packet_size` = **256 B = 16 fr** | [isochronous_stream_out.py:53,100](https://github.com/greatscottgadgets/luna) | ~0–3 fr (backpressured empty by `dac_fifo.w_rdy`) |
+| Playback (→ codec) | `audio_to_channels.dac_fifo` | **16 fr** | [audio_to_channels.py:105](gateware/src/tiliqua/usb_audio/audio_to_channels.py#L105) | ~12 fr (feedback setpoint) |
+| Capture (codec →) | `audio_to_channels.adc_fifo` | **16 fr** | [audio_to_channels.py:52](gateware/src/tiliqua/usb_audio/audio_to_channels.py#L52) | ~0–1 fr |
+| Capture (OUT to host) | `ChannelsToUSBStream.out_fifo` | 2 × `max_packet_size` = **256 B = 16 fr** | [channels_to_usb_stream.py:50](gateware/src/tiliqua/usb_audio/channels_to_usb_stream.py#L50) | ~6 fr (prefetch kept above `no_channels × 4` bytes by the `FILL` state at [channels_to_usb_stream.py:192-193](gateware/src/tiliqua/usb_audio/channels_to_usb_stream.py#L192-L193)) |
+| Capture (→ host) | LUNA `USBIsochronousStreamInEndpoint` | **0** (pure passthrough FSM) | [isochronous_stream_in.py](https://github.com/greatscottgadgets/luna) | 0 |
+
+So **LUNA/Tiliqua buffers up to 2 microframes (~250 µs / 16 frames)
+in each direction**, but the capture-side 2-microframe buffer lives in
+`ChannelsToUSBStream.out_fifo`, not in LUNA itself. Its level is
+**not** currently exposed in `USB2AudioInterface.DebugInterface` — the
+LED bar can't see it.
+
+### Why the measured `extra` looks flat
+
+What remains visible as "extra" at `q ≥ 256` is:
+
+- **HCI DMA head-of-queue** (≤ 1 microframe, absorbed into FIFO level
+  fluctuation on both paths).
+- **Four gateware FIFOs** in steady state: ~12 (dac) + ~1 (adc) + ~6
+  (`out_fifo` prefetch) + ~0 (LUNA RX, drained) ≈ **19 frames**.
+- **AK4619 codec group delay** (~14 frames combined, short-delay FIR).
+- A handful of frames of I²S/SOF alignment.
+
+Total matches the measured ~25–27 frames. Adding more host-side
+quantum does **not** increase the gateware overhead — the USB frame
+mechanism is a rate-matched pipeline, not a serial buffer stack.
+
 ## Decomposition of the hardware floor (~25 frames @ 48 kHz)
 
-| Contributor | Frames | Time |
-|---|---:|---:|
-| AK4619 ADC group delay (low-latency FIR, ~8/fs) | ~8 | ~167 µs |
-| AK4619 DAC group delay (low-latency FIR, ~12/fs) | ~12 | ~250 µs |
-| `adc_fifo` + `dac_fifo` steady-state (half of 16) | ~4 (avg under smooth feedback) | ~83 µs |
-| USB SOF alignment / I2S TDM serialization | ~1 | ~21 µs |
-| **Total** | **~25** | **~520 µs** |
+The gateware FIFO levels were visualised on an 8-LED PMOD (see the
+LED bar visualiser in [gateware/src/top/usb_audio/top.py](gateware/src/top/usb_audio/top.py))
+and directly confirm the steady-state occupancies used here:
 
-At small quantum the FIFO level is no longer smooth — the feedback
-loop at [gateware/src/tiliqua/usb_audio/__init__.py:437](gateware/src/tiliqua/usb_audio/__init__.py#L437)
+| Contributor | Frames | Time | How measured / known |
+|---|---:|---:|---|
+| AK4619 ADC group delay (short-delay FIR, ~6/fs) | ~6 | ~125 µs | Datasheet (short-delay mode) |
+| AK4619 DAC group delay (short-delay FIR, ~8/fs) | ~8 | ~167 µs | Datasheet (short-delay mode) |
+| `dac_fifo` steady-state occupancy | ~12 | ~250 µs | Observed: feedback loop settles at ~12/16 — see [__init__.py:437](gateware/src/tiliqua/usb_audio/__init__.py#L437), the `>> 3` correction term equilibrates wherever host/device XO drift cancels |
+| LUNA `USBIsochronousStreamOutEndpoint` RX FIFO | ~0–3 | ~0–63 µs | 2-µframe capacity, backpressured nearly empty by `dac_fifo.w_rdy` |
+| `adc_fifo` steady-state occupancy | ~0–1 | ~0–21 µs | Observed: host drains it as fast as samples arrive — LED4 solid, LED5–7 dark |
+| `ChannelsToUSBStream.out_fifo` prefetch | ~4–6 | ~83–125 µs | FSM's `FILL` state holds level above `no_channels × 4` bytes = 4 frames; average lands just above this floor unless USB drain jitters |
+| I²S TDM serialization / SOF alignment | ~1 | ~21 µs | Structural |
+| **Total (range)** | **~27–34** | **~560–710 µs** | Measured: 25 at q≥256. Codec GD numbers are upper-bound estimates; actual AK4619 short-delay FIR may be a few frames lower. |
+
+The lion's share of the floor is the **two 2-microframe buffers** on
+either side of the audio path (one in LUNA, one in `ChannelsToUSBStream`)
+plus the **~12-frame DAC FIFO occupancy** from the feedback loop's
+equilibrium. Together those three account for ~22 of the ~25 observed
+floor frames; the codec contributes only a handful.
+
+Note the DAC FIFO is the single largest contributor to the fixed
+floor — and it's there deliberately, to give the async feedback loop
+room to correct for host/device clock drift without underrunning. The
+ADC FIFO, lacking a feedback path, runs essentially empty.
+
+At small quantum the feedback loop at
+[gateware/src/tiliqua/usb_audio/__init__.py:437](gateware/src/tiliqua/usb_audio/__init__.py#L437)
 updates only every 32 ms, slower than the host wake-up period. The
-FIFO settles at a higher average occupancy to absorb jitter, adding
-the ~12–26 frames seen at `q ≤ 128`.
+DAC FIFO transiently overshoots/undershoots its setpoint during each
+loop update, adding the ~12–26 frames of extra overhead seen at
+`q ≤ 128`.
 
 ## Findings
 
@@ -137,10 +213,11 @@ the ~12–26 frames seen at `q ≤ 128`.
   `total = 2 × quantum + floor` line fits all stable points.
 - **q = 64 is the practical low-latency sweet spot.** 3.5 ms RTL,
   fully stable, no dropouts.
-- **q = 32 is measurable but not usable for audio work.** The
-  `Signal below threshold` warnings correspond to brief dropouts;
-  the feedback loop also starts hunting, visible as bimodal extra
-  loopback values (39 ↔ 51 frames).
+- **q = 32 shows the feedback loop hunting.** Extra loopback is
+  bimodal between 39 and 51 frames — the loop update period (32 ms)
+  is longer than the host wake-up, so the DAC FIFO swings around its
+  setpoint. Audibly usable if the host CPU can keep up, but no longer
+  deterministic.
 - Best-case hardware floor only appears at `q ≥ 256`, where the
   feedback loop has time to settle. This is a property of the
   loop period, not of the FIFO depth.
@@ -155,23 +232,29 @@ In order of increasing invasiveness:
    — update every 8 or 16 SOFs instead of 32. Should cut the extra
    loopback at small quantum from ~50 frames back to the ~25-frame
    floor and may allow stable operation at q = 32 (~2 ms RTL).
-3. **Reduce FIFO depth** at
+3. **Shift the DAC FIFO setpoint down** (same file, line 437) — the
+   `>> 3` proportional term currently equilibrates at ~12/16. Changing
+   the shift / adding an offset to target ~6/16 would reclaim ~6 frames
+   directly. Risk: less margin for XO drift; must go hand-in-hand with
+   (2) to keep underrun probability unchanged.
+4. **Reduce FIFO depth** at
    [gateware/src/tiliqua/usb_audio/__init__.py:420](gateware/src/tiliqua/usb_audio/__init__.py#L420)
-   from `16 → 8` samples. Saves up to ~8 frames but increases
-   under-run risk under USB jitter — validate with a long soak.
-4. **AK4619 configuration** — if not already in short-delay FIR
-   mode, switching would remove an additional ~10–15 frames of codec
-   group delay. Already appears to be the case given the observed
-   floor.
+   from `16 → 8`. **Careful**: the DAC FIFO currently runs at ~12/16
+   (75% full), so a depth of 8 would require (2)+(3) first or the FIFO
+   will underrun on the first feedback cycle. Safer stepping stone: 12.
+5. **AK4619 filter mode** — the observed ~520 µs floor is already
+   consistent with short-delay FIR being active. If a future firmware
+   switches to normal FIR (sharp roll-off), expect an additional
+   ~20 frames of codec group delay.
 
 ## Raw `jack_iodelay` output snippets
 
 ```
-q = 32  (marginal)
+q = 32  (feedback hunting)
    115.117 frames      2.398 ms total roundtrip latency
        extra loopback latency: 51 frames
-   (with transient modes: 39, 43, 52–54, 22/63 outliers,
-    "Signal below threshold..." warnings)
+   (with transient modes: 39, 43, 52–54, 22/63 outliers
+    as the feedback loop settles)
 
 q = 64
    168.117 frames      3.502 ms total roundtrip latency

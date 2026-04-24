@@ -72,20 +72,40 @@ class USBAudioTop(Elaboratable):
 
         # ADC FIFO has no feedback: the host drains samples as fast as they arrive,
         # so instantaneous level is 0 almost all the time with sub-microsecond
-        # excursions — invisible to the eye. Use a peak-hold with slow decay so
-        # transient bursts remain visible for a human timescale (~0.3 s/step).
-        adc_peak  = Signal(5)
-        adc_decay = Signal(12)  # 2**12 cycles @ ~60 MHz ≈ 140 ms
-        m.d.usb += adc_decay.eq(adc_decay + 1)
-        with m.If(usbif.dbg.adc_fifo_level > adc_peak):
-            m.d.usb += adc_peak.eq(usbif.dbg.adc_fifo_level)
-        with m.Elif((adc_decay == 0) & (adc_peak != 0)):
-            m.d.usb += adc_peak.eq(adc_peak - 1)
+        # excursions — invisible to the eye. Flip ADC_PEAK_HOLD to choose between
+        # a peak-hold with slow decay (rare backpressure bursts become visible on
+        # LED5-7) and a straight thermometer of the instantaneous level (LED4
+        # solid, others rarely fire).
+        ADC_PEAK_HOLD = True
+
+        if ADC_PEAK_HOLD:
+            adc_peak  = Signal(5)
+            adc_decay = Signal(17)
+            # Decay rate is one step per wrap of adc_decay in the usb domain (60 MHz).
+            # What matters isn't full decay time, but whether the peak can drop
+            # below an LED's threshold between successive events AT THAT LEVEL:
+            #
+            #   LED4 (peak ≥ 1): events every 21 µs (every audio sample) —
+            #       no practical decay is fast enough + visible; LED4 is a
+            #       solid-on "ADC is alive" indicator in all regimes.
+            #   LED5 (peak ≥ 2): USB-drain jitter events every few ms —
+            #       width 17 (≈2.2 ms/step) is the sweet spot; width 18+
+            #       (≥4 ms/step) is too slow → peak pins at 2, LED5 solid.
+            #   LED6/7 (peak ≥ 4/8): only fire on real backpressure; widths
+            #       20+ (≥17 ms/step) keep those events visible longest.
+            m.d.usb += adc_decay.eq(adc_decay + 1)
+            with m.If(usbif.dbg.adc_fifo_level > adc_peak):
+                m.d.usb += adc_peak.eq(usbif.dbg.adc_fifo_level)
+            with m.Elif((adc_decay == 0) & (adc_peak != 0)):
+                m.d.usb += adc_peak.eq(adc_peak - 1)
+            adc_display = adc_peak
+        else:
+            adc_display = usbif.dbg.adc_fifo_level
 
         adc_thresholds = (1, 2, 4, 8)
         for n, (dac_thr, adc_thr) in enumerate(zip(dac_thresholds, adc_thresholds)):
             m.d.comb += getattr(leds, f"led{n}").o.eq(usbif.dbg.dac_fifo_level >= dac_thr)
-            m.d.comb += getattr(leds, f"led{n+4}").o.eq(adc_peak >= adc_thr)
+            m.d.comb += getattr(leds, f"led{n+4}").o.eq(adc_display >= adc_thr)
 
         if platform.ila:
 

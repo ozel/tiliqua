@@ -130,6 +130,28 @@ and corrects position drift between the driver and follower node by
 jumping rather than resampling. Judge the device with raw ALSA, or watch
 the telemetry counters, not the PipeWire recording alone.
 
+### Cross-clock sync test against another USB sound card (2026-09-12)
+
+Setup: a C-Media full-speed USB card (adaptive OUT endpoint, so its DAC
+clock also follows the host's SOF timing) plays a 1 kHz sine into Tiliqua
+input 0; Tiliqua output 0 loops back to input 1; raw ALSA on both cards,
+10.6 minutes, telemetry on channels 2/3. `xclock.py` fits the 1 kHz
+component per second and tracks its phase.
+
+| | adaptive | async (SI5351) |
+|---|---:|---:|
+| other card's tone, frequency offset vs Tiliqua clock | +0.007 ppm | +15.2 ppm |
+| accumulated phase drift over 636 s | −0.01 samples | +435 samples |
+| tone wander around the fit (rms) | 0.50 samples | 6.3 samples |
+| capture zero-pad events | 10 (9 of them at stream start) | 117 (one every ~1.3 s while full duplex) |
+| DAC FIFO level | 4–10, 0 only at start/end | 0–13 |
+
+Two adaptive devices on one host therefore stay sample-locked
+indefinitely; two async devices walk apart at 15 ppm, about 0.7 samples
+per second. The async capture packetiser also pads a zero frame whenever
+the ADC (SI5351 clock) falls behind the IN packet size, which is
+mirrored from the host's OUT packets, giving the regular zero-pads above.
+
 ### Further hardware checks
 
 1. **Stress.** Start/stop the stream a hundred times, change the quantum
@@ -138,6 +160,6 @@ the telemetry counters, not the PipeWire recording alone.
 2. **Frequency.** Play 1 kHz from Tiliqua into a second sound card and
    measure it. Adaptive and async bitstreams should differ by exactly the
    SI5351 versus host-USB-clock offset, and adaptive must not wander.
-3. **The point of the feature.** Two Tiliquas in adaptive mode on one
-   host, both playing the same ramp, captured together: they must stay
-   sample-aligned indefinitely.
+3. **Two Tiliquas** in adaptive mode on one host, both playing the same
+   sine, captured together: they must stay sample-aligned indefinitely
+   (the C-Media test above is the single-Tiliqua version of this).

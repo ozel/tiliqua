@@ -20,13 +20,24 @@ class AudioToChannels(wiring.Component):
 
     # TODO: legacy: internal USB streams should be exposed as an ordinary wiring.Component.
 
-    def __init__(self, nr_channels, to_usb_stream, from_usb_stream, fifo_depth):
+    def __init__(self, nr_channels, to_usb_stream, from_usb_stream, fifo_depth, prefill_level=None):
+        """
+        prefill_level: if set, samples are only released to the audio side once
+        the DAC FIFO holds at least this many entries (re-armed whenever the
+        FIFO runs dry). Used in adaptive mode, where nothing else pushes the
+        FIFO away from empty at stream start.
+        """
         self.nr_channels = nr_channels
         self.to_usb = to_usb_stream
         self.from_usb = from_usb_stream
         self.fifo_depth = fifo_depth
+        self.prefill_level = prefill_level
+        if prefill_level is not None:
+            assert 0 < prefill_level < fifo_depth
         self.dac_fifo_level = Signal(range(fifo_depth+1))
         self.adc_fifo_level = Signal(range(fifo_depth+1))
+        # High while the DAC FIFO read side is released (always 1 without prefill).
+        self.dac_primed = Signal(init=0 if prefill_level is not None else 1)
         super().__init__({
             # streams for hooking up to audio source / sink, sent / recieved over USB.
             "i":  In(stream.Signature(data.ArrayLayout(ASQ, self.nr_channels))),
@@ -103,7 +114,22 @@ class AudioToChannels(wiring.Component):
         # HOST -> USB Channel stream -> eurorack-pmod calibrated OUTPUT samples.
         #
         m.submodules.dac_fifo = dac_fifo = AsyncFIFOBuffered(width=SW*self.nr_channels, depth=self.fifo_depth, w_domain="usb", r_domain="sync")
-        wiring.connect(m, dac_fifo.r_stream, wiring.flipped(self.o));
+        if self.prefill_level is None:
+            wiring.connect(m, dac_fifo.r_stream, wiring.flipped(self.o));
+        else:
+            # Hold the read side until the FIFO has filled to prefill_level,
+            # then stream normally until it runs empty, at which point re-arm.
+            primed = self.dac_primed
+            with m.If(~primed):
+                with m.If(dac_fifo.r_level >= self.prefill_level):
+                    m.d.sync += primed.eq(1)
+            with m.Elif(~dac_fifo.r_rdy):
+                m.d.sync += primed.eq(0)
+            m.d.comb += [
+                self.o.valid.eq(dac_fifo.r_rdy & primed),
+                self.o.payload.eq(dac_fifo.r_data),
+                dac_fifo.r_en.eq(self.o.ready & primed),
+            ]
 
         m.d.usb += dac_fifo.w_en.eq(0)
         for n in range(self.nr_channels):

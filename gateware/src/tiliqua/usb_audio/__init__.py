@@ -53,6 +53,16 @@ class USB2AudioInterface(wiring.Component):
                 "usb_stream_in_valid": Out(1),
                 "usb_stream_in_ready": Out(1),
                 "usb_stream_in_payload": Out(8),
+                # Adaptive-mode loop state (zero in async mode).
+                "sw_pll_error": Out(signed(24)),
+                "sw_pll_fcw": Out(32),
+                "sw_pll_locked": Out(1),
+                "out_active": Out(1),
+                # DAC FIFO read side released (prefill satisfied).
+                "dac_primed": Out(1),
+                # Capture packetiser padding zeros / discarding samples.
+                "capture_filling": Out(1),
+                "capture_skipping": Out(1),
             })
 
     """ USB Audio Class v2 interface """
@@ -388,39 +398,55 @@ class USB2AudioInterface(wiring.Component):
             usb_to_channel_stream.no_channels_in.eq(self.nr_channels),
         ]
 
+        # Adaptive mode: the SW PLL regulates the DAC FIFO level as sampled at
+        # SOF time (just before the microframe's packet lands) to this setpoint.
+        # Prefill to setpoint + one packet so the first SOF after stream start
+        # already sees roughly the setpoint.
+        self.samples_per_packet = self.fs // 8000
+        self.level_setpoint = 6
+        prefill_level = (self.level_setpoint + self.samples_per_packet
+                         if self.sync_mode == "adaptive" else None)
+
         m.submodules.audio_to_channels = audio_to_channels = AudioToChannels(
                 nr_channels=self.nr_channels,
                 to_usb_stream=channels_to_usb_stream.channel_stream_in,
                 from_usb_stream=usb_to_channel_stream.channel_stream_out,
-                fifo_depth=16 * (self.fs // 48000))
+                fifo_depth=16 * (self.fs // 48000),
+                prefill_level=prefill_level)
         wiring.connect(m, wiring.flipped(self.i), audio_to_channels.i)
         wiring.connect(m, audio_to_channels.o, wiring.flipped(self.o))
 
         if self.sync_mode == "adaptive":
             # --- Adaptive mode: Software PLL generates audio clock ---
-            # The SW PLL NCO runs in the USB domain and generates a recovered
-            # audio clock that tracks the host's SOF timing.
+            # The SW PLL runs in the USB domain. Its frequency loop locks a
+            # reference NCO to the host's SOF timing; its level loop nudges
+            # the output NCO so the DAC FIFO sits at the setpoint. The output
+            # drives the whole audio domain (see pll.py / usb_audio top).
             m.submodules.sw_pll = sw_pll = DomainRenamer("usb")(SwPLL(
                 ref_freq=60_000_000,
                 target_freq=12_288_000,
                 sof_accumulation=32,
+                level_setpoint=self.level_setpoint,
             ))
+
+            # Host is streaming to us if EP1 OUT delivered data since the last SOF.
+            out_seen = Signal()
+            out_active = Signal()
+            with m.If(usb.sof_detected):
+                m.d.usb += [out_active.eq(out_seen), out_seen.eq(0)]
+            with m.If(ep1_out.stream.valid):
+                m.d.usb += out_seen.eq(1)
+
             m.d.comb += [
                 sw_pll.sof_detected.eq(usb.sof_detected),
-                # In adaptive mode, we measure the NCO's own output to close
-                # the loop. The audio_clock_tick comes from the NCO output
-                # edges detected via EdgeToPulse.
-            ]
-            # Synchronize NCO mclk_out into USB domain for self-measurement
-            nco_edge_pulse = DomainRenamer("usb")(EdgeToPulse())
-            m.submodules.nco_edge_pulse = nco_edge_pulse
-            m.d.usb += nco_edge_pulse.edge_in.eq(sw_pll.mclk_out)
-            m.d.comb += sw_pll.audio_clock_tick.eq(nco_edge_pulse.pulse_out)
-
-            # Export recovered clock and lock status
-            m.d.comb += [
+                sw_pll.fifo_level.eq(audio_to_channels.dac_fifo_level),
+                sw_pll.stream_active.eq(out_active),
                 self.mclk_out.eq(sw_pll.mclk_out),
                 self.sw_pll_locked.eq(sw_pll.locked),
+                self.dbg.sw_pll_error.eq(sw_pll.dbg_error),
+                self.dbg.sw_pll_fcw.eq(sw_pll.dbg_fcw),
+                self.dbg.sw_pll_locked.eq(sw_pll.locked),
+                self.dbg.out_active.eq(out_active),
             ]
         else:
             # --- Async mode: Feedback endpoint tells host our clock rate ---
@@ -491,6 +517,9 @@ class USB2AudioInterface(wiring.Component):
             self.dbg.usb_stream_in_valid.eq(usb_to_channel_stream.usb_stream_in.valid),
             self.dbg.usb_stream_in_payload.eq(usb_to_channel_stream.usb_stream_in.payload),
             self.dbg.usb_stream_in_ready.eq(usb_to_channel_stream.usb_stream_in.ready),
+            self.dbg.dac_primed.eq(audio_to_channels.dac_primed),
+            self.dbg.capture_filling.eq(channels_to_usb_stream.filling),
+            self.dbg.capture_skipping.eq(channels_to_usb_stream.skipping),
         ]
 
         return m

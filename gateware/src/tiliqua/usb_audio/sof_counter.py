@@ -79,7 +79,12 @@ class SOFCounter(wiring.Component):
             with m.If(sof_sub == self.sof_accumulation - 1):
                 m.d.sync += [
                     sof_sub.eq(0),
-                    self.measured_count.eq(audio_counter),
+                    # A tick landing on this exact cycle belongs to the window
+                    # being closed. It must be folded into the measurement and
+                    # not simply overwritten by the reset below, otherwise the
+                    # loop sees a ~0.2 tick/window undercount and runs the NCO
+                    # fast by ~4 ppm forever (slow, permanent FIFO drain).
+                    self.measured_count.eq(audio_counter + self.audio_clock_tick),
                     self.measurement_valid.eq(1),
                     audio_counter.eq(0),
                 ]

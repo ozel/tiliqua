@@ -2,6 +2,13 @@
 4-channel USB2 audio interface, no video, no SoC.
 
 Enumerates as a 4-in, 4-out 48kHz sound card.
+
+By default the device is an asynchronous UAC2 sink/source with a feedback
+endpoint (the SI5351 provides the audio clock). With ``--adaptive`` it is an
+adaptive sink/source instead: a software PLL recovers the audio clock from
+USB SOF timing and the DAC FIFO level (see ``adaptive.md``). ``--telemetry``
+replaces capture channels 2/3 with FIFO/PLL state for bench testing
+(decode with ``telemetry_decode.py``).
 """
 
 from amaranth import *
@@ -24,15 +31,26 @@ class USBAudioTop(Elaboratable):
         io_right=['', 'USB audio device', '', 'FIFO bar (pmod0)', '', '']
     )
 
-    def __init__(self, clock_settings, sync_mode="async"):
+    def __init__(self, clock_settings, sync_mode="async", telemetry=False):
         super().__init__()
         self.clock_settings = clock_settings
         self.sync_mode = sync_mode
+        self.telemetry = telemetry
 
     def elaborate(self, platform):
         m = Module()
 
-        m.submodules.car = car = platform.clock_domain_generator(self.clock_settings)
+        if self.sync_mode == "adaptive":
+            # The audio domain is clocked by the SW PLL NCO output (fabric clock
+            # via DCCA) for the whole life of the bitstream. Only the external
+            # PLL clock generator supports substituting the audio clock source.
+            if platform.clock_domain_generator is not pll.TiliquaDomainGeneratorPLLExternal:
+                raise ValueError("adaptive USB audio requires a platform with the external-PLL clock generator")
+            nco_mclk = Signal()
+            m.submodules.car = car = platform.clock_domain_generator(
+                    self.clock_settings, audio_clock_override_clk=nco_mclk)
+        else:
+            m.submodules.car = car = platform.clock_domain_generator(self.clock_settings)
         m.submodules.reboot = reboot = RebootProvider(car.settings.frequencies.sync)
         m.submodules.btn = cdc.FFSynchronizer(
                 platform.request("encoder").s.i, reboot.button)
@@ -46,13 +64,70 @@ class USBAudioTop(Elaboratable):
                 audio_clock=self.clock_settings.audio_clock, nr_channels=4,
                 sync_mode=self.sync_mode)
 
-        wiring.connect(m, pmod0.o_cal, usbif.i)
+        if self.telemetry:
+            # Replace capture channels 2 and 3 with device-side telemetry so
+            # that FIFO/loop state is recorded sample-aligned with the audio
+            # on channels 0/1 (see telemetry_decode.py next to this file).
+            #
+            # ch2 (16 bit): [4:0] DAC FIFO level  [6:5] field index k
+            #               [7] dac_primed [8] out_active [9] sw_pll_locked
+            #               [14:10] ADC FIFO level
+            # ch3 (16 bit): k=0 underrun count (prefill re-arms)
+            #               k=1 SW PLL error (signed, ticks/window)
+            #               k=2 (fcw_base - nominal) / 64 (signed)
+            #               k=3 [7:0] capture fill events, [15:8] capture skip events
+            d = usbif.dbg
+            def rising(sig):
+                prev = Signal()
+                m.d.usb += prev.eq(sig)
+                return sig & ~prev
+            underruns = Signal(16)
+            fills = Signal(8)
+            skips = Signal(8)
+            with m.If(rising(~d.dac_primed)):
+                m.d.usb += underruns.eq(underruns + 1)
+            with m.If(rising(d.capture_filling)):
+                m.d.usb += fills.eq(fills + 1)
+            with m.If(rising(d.capture_skipping)):
+                m.d.usb += skips.eq(skips + 1)
+            nominal_fcw = round((12_288_000 / 60_000_000) * 2**32)
+            fcw_dev = Signal(signed(32))
+            m.d.comb += fcw_dev.eq(d.sw_pll_fcw - nominal_fcw)
+
+            k = Signal(2)
+            ch2 = Signal(16)
+            ch3 = Signal(16)
+            m.d.comb += ch2.eq(Cat(d.dac_fifo_level[:5], k, d.dac_primed, d.out_active,
+                                   d.sw_pll_locked, d.adc_fifo_level[:5]))
+            with m.Switch(k):
+                with m.Case(0):
+                    m.d.comb += ch3.eq(underruns)
+                with m.Case(1):
+                    m.d.comb += ch3.eq(d.sw_pll_error[:16])
+                with m.Case(2):
+                    m.d.comb += ch3.eq((fcw_dev >> 6)[:16])
+                with m.Case(3):
+                    m.d.comb += ch3.eq(Cat(fills, skips))
+
+            m.d.comb += [
+                usbif.i.valid.eq(pmod0.o_cal.valid),
+                pmod0.o_cal.ready.eq(usbif.i.ready),
+                usbif.i.payload[0].eq(pmod0.o_cal.payload[0]),
+                usbif.i.payload[1].eq(pmod0.o_cal.payload[1]),
+                usbif.i.payload[2].as_value().eq(ch2),
+                usbif.i.payload[3].as_value().eq(ch3),
+            ]
+            with m.If(usbif.i.valid & usbif.i.ready):
+                m.d.sync += k.eq(k + 1)
+        else:
+            wiring.connect(m, pmod0.o_cal, usbif.i)
         wiring.connect(m, usbif.o, pmod0.i_cal)
 
         # 8-LED PMOD on expansion port 0: thermometer-style FIFO level display.
         # LEDs 0-3 = DAC FIFO bar, LEDs 4-7 = ADC FIFO bar. PinsN handles the
         # low-active polarity at the pad, so we drive 1 to turn an LED on.
-        # FIFO depth is 16 samples at 48 kHz; feedback loop targets half-full.
+        # FIFO depth is 16 samples at 48 kHz. Async mode's feedback settles the
+        # DAC FIFO around 12; adaptive mode's level loop holds it between ~4 and 10.
         platform.add_resources([
             Resource("usb_audio_leds", 0,
                 Subsignal("led0", PinsN("7",  conn=("pmod", 0), dir="o")),
@@ -109,14 +184,8 @@ class USBAudioTop(Elaboratable):
             m.d.comb += getattr(leds, f"led{n}").o.eq(usbif.dbg.dac_fifo_level >= dac_thr)
             m.d.comb += getattr(leds, f"led{n+4}").o.eq(adc_display >= adc_thr)
 
-        # In adaptive mode, wire up the SW PLL recovered clock
-        # to override the audio domain clock source.
         if self.sync_mode == "adaptive":
-            if hasattr(car, 'audio_clock_override'):
-                m.d.comb += [
-                    car.audio_clock_override.eq(usbif.sw_pll_locked),
-                    car.audio_clock_override_clk.eq(usbif.mclk_out),
-                ]
+            m.d.comb += nco_mclk.eq(usbif.mclk_out)
 
         if platform.ila:
 
@@ -159,12 +228,15 @@ class USBAudioTop(Elaboratable):
 def add_adaptive_args(parser):
     parser.add_argument('--adaptive', action='store_true',
                         help="Use adaptive USB audio sync mode (device tracks host clock via SW PLL).")
+    parser.add_argument('--telemetry', action='store_true',
+                        help="Replace capture channels 2/3 with FIFO/PLL telemetry (see telemetry_decode.py).")
 
 
 def parse_adaptive_args(args):
     if args.adaptive and args.fs_192khz:
         raise SystemExit("error: --adaptive is not supported with --fs-192khz (192kHz mode)")
-    return {"sync_mode": "adaptive" if args.adaptive else "async"}
+    return {"sync_mode": "adaptive" if args.adaptive else "async",
+            "telemetry": args.telemetry}
 
 
 if __name__ == "__main__":

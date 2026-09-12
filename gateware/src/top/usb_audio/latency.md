@@ -1,5 +1,10 @@
 # Tiliqua USB Audio — Round-Trip Latency Measurement
 
+*Measured in the default asynchronous (feedback endpoint) mode. For the
+adaptive mode, its clock recovery loop and the device telemetry / sine
+loopback test that also catches single-sample dropouts (which
+`jack_iodelay` cannot see), read [adaptive.md](adaptive.md).*
+
 Measurement of end-to-end round-trip latency (RTL) through the Tiliqua
 `usb_audio` core, from USB host → FPGA → AK4619 DAC → analog loopback
 cable → AK4619 ADC → FPGA → USB host.
@@ -206,6 +211,11 @@ loop update, adding the ~12–26 frames of extra overhead seen at
 `q ≤ 128`.
 
 ## Findings
+
+- **`jack_iodelay` measures delay, not continuity.** A later sine-loopback
+  scan (see [adaptive.md](adaptive.md)) showed that async mode pads one
+  zero sample into the capture stream roughly every 10 s, invisible to
+  this measurement.
 
 - **Fixed hardware contribution: ~25 frames / 520 µs.** This is
   excellent for a class-compliant USB audio interface.

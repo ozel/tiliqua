@@ -13,12 +13,11 @@ t2 = raw[:,2]; t3 = raw[:,3]
 dac_level = ((t2 >> 16) & 0x1f).astype(np.int8); k = ((t2 >> 21) & 3).astype(np.int8)
 primed = ((t2 >> 23) & 1).astype(np.int8)
 u = (t3[k==0] >> 16) & 0xffff; fills = (t3[k==3] >> 16) & 0xff
-fcw = ((t3[k==2] >> 16) & 0xffff).astype(np.int64); fcw = np.where(fcw >= 0x8000, fcw-0x10000, fcw)*64
-nominal = round(12_288_000/60_000_000*2**32)
+ctrl = ((t3[k==2] >> 16) & 0xffff).astype(np.int64); ctrl = np.where(ctrl >= 0x8000, ctrl-0x10000, ctrl) / 16.0   # ppm
 print(f"{fn}: {n/fs:.1f} s")
 if len(u):
     print(f"telemetry: underruns {u[0]}->{u[-1]}, capture fills {fills[0]}->{fills[-1]}, "
-          f"PLL fcw {np.median(fcw)/nominal*1e6:+.2f} ppm (min {fcw.min()/nominal*1e6:+.2f} max {fcw.max()/nominal*1e6:+.2f}), "
+          f"loop ctrl {np.median(ctrl):+.2f} ppm (min {ctrl.min():+.2f} max {ctrl.max():+.2f}), "
           f"dac level min/max {dac_level.min()}/{dac_level.max()}, per-minute min {[int(dac_level[i:i+60*fs].min()) for i in range(0,n,60*fs)]}")
 w0 = 2*np.pi*f0/fs
 for ch, name in ((0, "ch0 other-card tone"), (1, "ch1 loopback")):

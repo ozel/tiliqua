@@ -5,10 +5,13 @@ Enumerates as a 4-in, 4-out 48kHz sound card.
 
 By default the device is an asynchronous UAC2 sink/source with a feedback
 endpoint (the SI5351 provides the audio clock). With ``--adaptive`` it is an
-adaptive sink/source instead: a software PLL recovers the audio clock from
-USB SOF timing and the DAC FIFO level (see ``adaptive.md``). ``--telemetry``
-replaces capture channels 2/3 with FIFO/PLL state for bench testing
-(decode with ``telemetry_decode.py``).
+adaptive sink/source instead: a loop recovers the audio clock from USB SOF
+timing and the DAC FIFO level (see ``adaptive.md``). ``--adaptive-clock``
+picks the actuator: ``si5351`` (default) steers the external PLL's fractional
+numerator over I2C and keeps its low-jitter output as MCLK; ``nco`` generates
+MCLK from a phase accumulator in the FPGA. ``--telemetry`` replaces capture
+channels 2/3 with FIFO/loop state for bench testing (decode with
+``telemetry_decode.py``).
 """
 
 from amaranth import *
@@ -17,7 +20,8 @@ from amaranth.lib import cdc, wiring
 
 from tiliqua import pll, usb_audio
 from tiliqua.build.cli import top_level_cli
-from tiliqua.periph import eurorack_pmod
+from tiliqua.periph import eurorack_pmod, i2c
+from tiliqua.usb_audio.si5351_tuner import Si5351Tuner
 from tiliqua.build.types import BitstreamHelp
 from tiliqua.platform import RebootProvider
 from vendor.ila import AsyncSerialILA
@@ -31,21 +35,28 @@ class USBAudioTop(Elaboratable):
         io_right=['', 'USB audio device', '', 'FIFO bar (pmod0)', '', '']
     )
 
-    def __init__(self, clock_settings, sync_mode="async", telemetry=False):
+    def __init__(self, clock_settings, sync_mode="async", adaptive_clock="si5351", telemetry=False):
         super().__init__()
         self.clock_settings = clock_settings
         self.sync_mode = sync_mode
+        self.adaptive_clock = adaptive_clock
         self.telemetry = telemetry
+        self.use_nco = sync_mode == "adaptive" and adaptive_clock == "nco"
+        self.use_si5351 = sync_mode == "adaptive" and adaptive_clock == "si5351"
+        # Spread spectrum on the SI5351 audio PLL would add periodic jitter to
+        # MCLK and is pointless on a clock we retune anyway (the tuner also
+        # switches it off at start-up). Bitstream archiver picks this up.
+        self.external_pll_spread_spectrum = None if self.use_si5351 else 0.01
 
     def elaborate(self, platform):
         m = Module()
 
-        if self.sync_mode == "adaptive":
+        if self.sync_mode == "adaptive" and \
+                platform.clock_domain_generator is not pll.TiliquaDomainGeneratorPLLExternal:
+            raise ValueError("adaptive USB audio requires a platform with the external-PLL clock generator")
+        if self.use_nco:
             # The audio domain is clocked by the SW PLL NCO output (fabric clock
-            # via DCCA) for the whole life of the bitstream. Only the external
-            # PLL clock generator supports substituting the audio clock source.
-            if platform.clock_domain_generator is not pll.TiliquaDomainGeneratorPLLExternal:
-                raise ValueError("adaptive USB audio requires a platform with the external-PLL clock generator")
+            # via DCCA) for the whole life of the bitstream.
             nco_mclk = Signal()
             m.submodules.car = car = platform.clock_domain_generator(
                     self.clock_settings, audio_clock_override_clk=nco_mclk)
@@ -62,7 +73,17 @@ class USBAudioTop(Elaboratable):
 
         m.submodules.usbif = usbif = usb_audio.USB2AudioInterface(
                 audio_clock=self.clock_settings.audio_clock, nr_channels=4,
-                sync_mode=self.sync_mode)
+                sync_mode=self.sync_mode, adaptive_clock=self.adaptive_clock)
+
+        if self.use_si5351:
+            # Steer the external PLL over the mobo I2C bus (100 kHz max).
+            m.submodules.i2c_provider = i2c_provider = i2c.Provider()
+            m.submodules.si5351_tuner = tuner = DomainRenamer("usb")(Si5351Tuner(period_cyc=600))
+            wiring.connect(m, tuner.pins, i2c_provider.pins)
+            m.d.comb += [
+                tuner.ctrl.eq(usbif.clk_ctrl),
+                tuner.update.eq(usbif.clk_update),
+            ]
 
         if self.telemetry:
             # Replace capture channels 2 and 3 with device-side telemetry so
@@ -74,7 +95,7 @@ class USBAudioTop(Elaboratable):
             #               [14:10] ADC FIFO level
             # ch3 (16 bit): k=0 underrun count (prefill re-arms)
             #               k=1 SW PLL error (signed, ticks/window)
-            #               k=2 (fcw_base - nominal) / 64 (signed)
+            #               k=2 loop frequency control in 1/16 ppm (signed)
             #               k=3 [7:0] capture fill events, [15:8] capture skip events
             d = usbif.dbg
             def rising(sig):
@@ -90,9 +111,8 @@ class USBAudioTop(Elaboratable):
                 m.d.usb += fills.eq(fills + 1)
             with m.If(rising(d.capture_skipping)):
                 m.d.usb += skips.eq(skips + 1)
-            nominal_fcw = round((12_288_000 / 60_000_000) * 2**32)
-            fcw_dev = Signal(signed(32))
-            m.d.comb += fcw_dev.eq(d.sw_pll_fcw - nominal_fcw)
+            ctrl_ppm16 = Signal(signed(32))
+            m.d.comb += ctrl_ppm16.eq(d.sw_pll_ctrl_freq >> 4)
 
             k = Signal(2)
             ch2 = Signal(16)
@@ -105,7 +125,7 @@ class USBAudioTop(Elaboratable):
                 with m.Case(1):
                     m.d.comb += ch3.eq(d.sw_pll_error[:16])
                 with m.Case(2):
-                    m.d.comb += ch3.eq((fcw_dev >> 6)[:16])
+                    m.d.comb += ch3.eq(ctrl_ppm16[:16])
                 with m.Case(3):
                     m.d.comb += ch3.eq(Cat(fills, skips))
 
@@ -184,7 +204,7 @@ class USBAudioTop(Elaboratable):
             m.d.comb += getattr(leds, f"led{n}").o.eq(usbif.dbg.dac_fifo_level >= dac_thr)
             m.d.comb += getattr(leds, f"led{n+4}").o.eq(adc_display >= adc_thr)
 
-        if self.sync_mode == "adaptive":
+        if self.use_nco:
             m.d.comb += nco_mclk.eq(usbif.mclk_out)
 
         if platform.ila:
@@ -227,7 +247,10 @@ class USBAudioTop(Elaboratable):
 
 def add_adaptive_args(parser):
     parser.add_argument('--adaptive', action='store_true',
-                        help="Use adaptive USB audio sync mode (device tracks host clock via SW PLL).")
+                        help="Use adaptive USB audio sync mode (device recovers its clock from the host).")
+    parser.add_argument('--adaptive-clock', choices=['si5351', 'nco'], default='si5351',
+                        help="Adaptive mode actuator: retune the external SI5351 PLL over I2C "
+                             "(default, low jitter) or generate MCLK from an NCO in the FPGA.")
     parser.add_argument('--telemetry', action='store_true',
                         help="Replace capture channels 2/3 with FIFO/PLL telemetry (see telemetry_decode.py).")
 
@@ -236,6 +259,7 @@ def parse_adaptive_args(args):
     if args.adaptive and args.fs_192khz:
         raise SystemExit("error: --adaptive is not supported with --fs-192khz (192kHz mode)")
     return {"sync_mode": "adaptive" if args.adaptive else "async",
+            "adaptive_clock": args.adaptive_clock,
             "telemetry": args.telemetry}
 
 

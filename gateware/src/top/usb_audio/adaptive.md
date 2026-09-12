@@ -7,50 +7,50 @@ own USB clock, and the device recovers an audio clock from that stream.
 
 ## How the clock is recovered
 
-All of this lives in `usb_audio/sw_pll.py` and runs in the 60 MHz `usb`
-domain.
+`usb_audio/clock_recovery.py` runs in the 60 MHz `usb` domain and is
+independent of what generates the audio clock. It counts audio-clock ticks
+per window of 32 SOFs and produces a control value in 1/256 ppm:
 
-Two 32-bit phase accumulators (NCOs) run side by side:
+* **Frequency loop.** `sof_counter.py` counts ticks per window (4 ms) and
+  compares against the nominal 49152. The correction is incremental,
+  `ctrl_freq += error * Kp`, with Kp half the deadbeat gain, so the error
+  halves every window and settles to the ±1 tick quantisation (one tick is
+  20 ppm). Clamped to ±2000 ppm.
+* **Level loop.** At the window-closing SOF, just before that microframe's
+  packet lands, the DAC FIFO level is compared to the setpoint (6 of 16).
+  The difference times 20 ppm per sample is `ctrl_level`. A FIFO above
+  setpoint drains slightly faster and vice versa, with a first-order time
+  constant of about 1 s. Forced to zero while the host is not streaming.
+* The actuator applies `ctrl_total = ctrl_freq + ctrl_level`. Because the
+  measured clock carries the level term too, its known contribution
+  (`ctrl_level * 49152 * 1e-6` ticks per window) is subtracted from the
+  measurement, so the frequency loop never fights the level loop.
 
-| NCO | driven by | purpose |
+Two actuators, selected at build time with `--adaptive-clock`:
+
+| | `si5351` (default) | `nco` |
 |---|---|---|
-| reference | `fcw_base` | measured by the SOF counter; locked to the host's SOF rate |
-| output | `fcw_base + level_term` | its MSB is MCLK for the whole `audio` domain |
+| audio clock source | SI5351A clk0, as in async mode | 32-bit phase accumulator in the FPGA, MSB through a DCCA |
+| how it is tuned | `usb_audio/si5351_tuner.py` rewrites PLLA's 20-bit fractional numerator over the mobo I2C bus (0x60, 100 kHz) once per window; one step is 0.027 ppm | frequency control word |
+| jitter on MCLK | the SI5351's own, tens of ps | ±8 ns period jitter (MSB toggles after 4 or 5 reference cycles) |
+| extra hardware use | mobo I2C bus, shared with LED driver, USB-C controller and EDID | none |
+| clock path | unchanged, `expll_clk0` | audio domain clocked from fabric for the life of the bitstream |
 
-**Frequency loop.** `sof_counter.py` counts reference-NCO wraps (carry
-outs, so no edge detector and no lost ticks) per window of 32 SOFs and
-compares against the nominal 49152. The correction is incremental,
-`fcw_base += error * Kp`, with Kp equal to half the deadbeat gain, so the
-error halves every 4 ms window and settles to the ±1 tick quantisation
-(one tick is 20 ppm). `fcw_base` is clamped to ±2000 ppm of nominal.
-
-**Level loop.** At every SOF, just before that microframe's packet lands,
-the DAC FIFO level is sampled and compared to the setpoint (6 of 16). The
-difference times 20 ppm per sample is added to the output NCO only. A
-FIFO above setpoint therefore drains slightly faster and vice versa, with
-a first-order time constant of about 1 s. The loop is disabled (term
-forced to zero) while the host is not streaming.
-
-Because the frequency loop measures the *reference* NCO and never the
-output NCO, the two loops do not fight: the level term is invisible to
-the SOF measurement.
+SI5351 details: the tuner recomputes the bootloader's PLLA settings (a=35,
+b=408357, c=2^20−1, VCO 884.736 MHz, MultiSynth 72) and only ever changes
+`b`. Updating the fractional numerator is glitch-free and needs no PLL
+reset; the chip's spread-spectrum engine modulates that same divider. With
+`c = 2^20−1` the register math needs no divider (`floor(128b/c) = b >> 13`).
+At start-up the tuner clears the spread-spectrum enable bit, since the
+bootloader turns on a 1 % spread by default and that would add periodic
+jitter to MCLK; the bitstream manifest for this mode also requests no
+spread. Each update writes registers 26–33 in one 10-byte transaction,
+about 1 ms at 100 kHz, a quarter of the 4 ms window.
 
 **Prefill.** In adaptive mode `AudioToChannels` holds the DAC FIFO read
 side until 12 samples (setpoint plus one packet) have arrived, then
 streams. It re-arms whenever the FIFO runs dry, so an underrun costs one
 250 µs resync rather than continuous glitching.
-
-**Clock path.** The output NCO's MSB drives the `audio` domain through a
-DCCA global clock buffer for the whole life of the bitstream. There is no
-runtime clock mux (a fabric mux would glitch the audio domain and its
-async FIFO pointers at the moment of switching) and the SI5351 `clk0` is
-simply unused. Before lock the free-running NCO is already within crystal
-tolerance of 12.288 MHz.
-
-Known limitation: an NCO clock has ±8 ns period jitter (the MSB toggles
-after 4 or 5 reference cycles). This is inherent to the approach and
-bounds converter SNR at high audio frequencies. Steering the SI5351's
-fractional divider over I2C from the same loops would remove it.
 
 ## What went wrong in the first version
 
@@ -73,8 +73,12 @@ reproduces all three failure modes of the original implementation:
 ### Simulation
 
 `pdm run pytest tests/test_sw_pll.py` runs the loop closed at a scaled
-clock (600 kHz reference, 8-SOF windows) with a host clock offset and a
-FIFO model, asserting lock, zero lost ticks, and level convergence.
+clock with a host clock offset and a FIFO model, for both actuators:
+the NCO directly, and the SI5351 path through the tuner, a bus model that
+ACKs and decodes the I2C bytes, and a behavioural SI5351 whose frequency
+follows the written numerator. Asserted: lock, zero lost ticks, clamping,
+level convergence from above and below, the prefill handshake, and the
+exact register bytes of the start-up and update transactions.
 
 ### Device telemetry (recommended first step on hardware)
 
@@ -86,7 +90,7 @@ and 3 with device state, recorded sample-aligned with the audio:
 | ch2 | `[4:0]` DAC FIFO level, `[6:5]` field index k, `[7]` prefill released, `[8]` host streaming, `[9]` PLL locked, `[14:10]` ADC FIFO level |
 | ch3, k=0 | prefill re-arm (underrun) count |
 | ch3, k=1 | PLL error, ticks per window (signed) |
-| ch3, k=2 | (FCW − nominal) / 64 (signed) |
+| ch3, k=2 | loop frequency control in 1/16 ppm (signed) |
 | ch3, k=3 | `[7:0]` capture zero-fill events, `[15:8]` capture discard events |
 
 Record with the AUX channel map, otherwise PipeWire zeroes the unmapped
@@ -115,7 +119,8 @@ Raw ALSA (`aplay`/`arecord -D hw:Tiliqua`, PipeWire profile set to off),
 | async (feedback endpoint) | 120 s | 10, one every ~10 s, each a 1-sample zero pad | not instrumented | capture packetiser padding when the ADC clock runs behind the packet rate mirrored from the host |
 | original adaptive (branch head) | 120 s | 18, one every 5–10 s, each a 1-sample insert | not instrumented | matches the "never worked" report |
 | new adaptive | 120 s | 0 | 4–10, never below 4 | one re-prime at stream start, one at stream end |
-| new adaptive | 626 s, 3 file restarts | 0 between restarts | 4–10 in every 5-minute stretch | per restart: one re-prime plus three single-sample zero pads from the capture packetiser within 1.2 s |
+| new adaptive, NCO | 626 s, 3 file restarts | 0 between restarts | 4–10 in every 5-minute stretch | per restart: one re-prime plus three single-sample zero pads from the capture packetiser within 1.2 s |
+| new adaptive, SI5351 | 120 s | 0 | 4–10, never below 4 | loop control settled at +18.5 ppm; one re-prime at stream start, one at stream end |
 
 The frequency loop locks within 20 ms and sits at ±1 tick (20 ppm) of
 quantisation; the host's USB clock measured −6.2 ppm relative to the
@@ -138,19 +143,39 @@ input 0; Tiliqua output 0 loops back to input 1; raw ALSA on both cards,
 10.6 minutes, telemetry on channels 2/3. `xclock.py` fits the 1 kHz
 component per second and tracks its phase.
 
-| | adaptive | async (SI5351) |
-|---|---:|---:|
-| other card's tone, frequency offset vs Tiliqua clock | +0.007 ppm | +15.2 ppm |
-| accumulated phase drift over 636 s | −0.01 samples | +435 samples |
-| tone wander around the fit (rms) | 0.50 samples | 6.3 samples |
-| capture zero-pad events | 10 (9 of them at stream start) | 117 (one every ~1.3 s while full duplex) |
-| DAC FIFO level | 4–10, 0 only at start/end | 0–13 |
+| | adaptive, NCO | adaptive, SI5351 | async (SI5351 free-running) |
+|---|---:|---:|---:|
+| other card's tone, frequency offset vs Tiliqua clock | +0.007 ppm | −0.004 ppm | +15.2 ppm |
+| accumulated phase drift over 636 s | −0.01 samples | −0.06 samples | +435 samples |
+| tone wander around the fit (rms) | 0.50 samples | 0.22 samples | 6.3 samples |
+| loopback wander around the fit (rms) | 2.4 samples | 0.55 samples | 5.2 samples |
+| capture zero-pad events | 10 (9 of them at stream start) | 6 (all at stream start) | 117 (one every ~1.3 s while full duplex) |
+| DAC FIFO level | 4–10, 0 only at start/end | 4–10, 0 only at start/end | 0–13 |
+| loop frequency control over the run | −6.2 ppm, steady | +7 to +26 ppm, tracking the SI5351 crystal's drift | n/a |
 
 Two adaptive devices on one host therefore stay sample-locked
 indefinitely; two async devices walk apart at 15 ppm, about 0.7 samples
 per second. The async capture packetiser also pads a zero frame whenever
 the ADC (SI5351 clock) falls behind the IN packet size, which is
 mirrored from the host's OUT packets, giving the regular zero-pads above.
+
+### MCLK jitter: 10 kHz tone noise floor (2026-09-12)
+
+Same loopback, a 10 kHz sine at −20 dBFS for 90 s per build, raw ALSA,
+`tonefloor.py`. Jitter noise scales with signal frequency, so 10 kHz is
+where clock quality shows above the analog floor. Tone lands at −26.4 dBFS
+on the input in all three cases.
+
+| build | audio clock | floor 20 Hz..9.8 kHz | close-in ±0.1..2 kHz | 2nd harmonic |
+|---|---|---:|---:|---:|
+| adaptive, SI5351 | SI5351 retuned, spread spectrum off | −81.6 dBFS | −79.3 dBFS | −76.4 dBc |
+| adaptive, NCO | 60 MHz accumulator MSB | −79.7 dBFS | −77.7 dBFS | −76.3 dBc |
+| async | SI5351 as programmed by the bootloader, 1 % spread spectrum on | −73.0 dBFS | −70.0 dBFS | −75.4 dBc |
+
+The tuned SI5351 is 2 dB cleaner than the NCO and 9 dB cleaner than the
+stock async clock. Most of that 9 dB is the bootloader's default 1 %
+spread spectrum on PLLA, which also feeds the codec in async mode; that
+default is worth revisiting independently of adaptive mode.
 
 ### Further hardware checks
 

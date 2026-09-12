@@ -44,12 +44,10 @@ def s16(v):
 
 underruns = t3[k == 0]
 err = s16(t3[k == 1])
-fcw_dev = s16(t3[k == 2]) * 64
+ctrl_ppm = s16(t3[k == 2]) / 16.0     # loop frequency control, 1/16 ppm units
 fills = t3[k == 3] & 0xff
 skips = (t3[k == 3] >> 8) & 0xff
 
-nominal_fcw = round((12_288_000 / 60_000_000) * 2**32)
-ppm = fcw_dev / nominal_fcw * 1e6
 
 print(f"{args.wav}: {n/fs:.1f} s at {fs} Hz")
 print(f"locked {locked.mean()*100:.1f}% of samples, out_active {out_active.mean()*100:.1f}%, primed {primed.mean()*100:.1f}%")
@@ -90,14 +88,14 @@ else:
 
 # Per-interval summary.
 step = int(args.interval * fs)
-print(f"\n{'t[s]':>7} {'dac min/mean/max':>17} {'adc max':>7} {'underruns':>9} {'err':>5} {'fcw ppm':>8} {'fill':>4} {'skip':>4} {'act':>3} {'lk':>2}")
+print(f"\n{'t[s]':>7} {'dac min/mean/max':>17} {'adc max':>7} {'underruns':>9} {'err':>5} {'ctrl ppm':>8} {'fill':>4} {'skip':>4} {'act':>3} {'lk':>2}")
 for s0 in range(0, n, step):
     s1 = min(n, s0 + step)
     sl = slice(s0, s1)
     kk = k[sl]
-    u = t3[sl][kk == 0]; e = s16(t3[sl][kk == 1]); f = s16(t3[sl][kk == 2]) * 64
+    u = t3[sl][kk == 0]; e = s16(t3[sl][kk == 1]); f = s16(t3[sl][kk == 2]) / 16.0
     fl = t3[sl][kk == 3] & 0xff; sk = (t3[sl][kk == 3] >> 8) & 0xff
     dl = dac_level[sl]
     print(f"{s0/fs:7.1f} {dl.min():5d}/{dl.mean():5.1f}/{dl.max():3d}   {adc_level[sl].max():5d}   {u[-1] if len(u) else 0:7d} {int(np.median(e)) if len(e) else 0:5d} "
-          f"{np.median(f)/nominal_fcw*1e6 if len(f) else 0:8.1f} {fl[-1] if len(fl) else 0:4d} {sk[-1] if len(sk) else 0:4d} "
+          f"{np.median(f) if len(f) else 0:8.1f} {fl[-1] if len(fl) else 0:4d} {sk[-1] if len(sk) else 0:4d} "
           f"{out_active[sl].mean():3.1f} {locked[sl].mean():2.0f}")

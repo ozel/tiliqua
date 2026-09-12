@@ -32,6 +32,7 @@ Tiliqua is a **Eurorack Module**, which contains a debugger, FPGA and high-fidel
    custom_dsp
    beamrace_video
    cpu_bitstreams
+   pmods
    bootloader
 
 .. toctree::
@@ -41,6 +42,7 @@ Tiliqua is a **Eurorack Module**, which contains a debugger, FPGA and high-fidel
    examples/index
    dsp/index
    calibration
+   usb_troubleshooting
 
 .. toctree::
    :caption: Hardware Details

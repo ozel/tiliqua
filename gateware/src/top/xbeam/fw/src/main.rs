@@ -7,6 +7,9 @@ use riscv_rt::entry;
 use irq::handler;
 use core::cell::RefCell;
 
+use midi_types::*;
+use midi_convert::parse::MidiTryParseSlice;
+
 use tiliqua_fw::*;
 use tiliqua_lib::*;
 use tiliqua_lib::dsp::OnePoleSmoother;
@@ -17,14 +20,76 @@ use tiliqua_hal::embedded_graphics::prelude::*;
 
 use options::*;
 use opts::persistence::*;
+use opts::{Options, OptionTrait};
+use opts::cc_map::{MidiCcMapper, CcMapMode};
 use hal::pca9635::Pca9635Driver;
+use tiliqua_hal::dma_framebuffer::Rotate;
 use tiliqua_hal::tusb322::{TUSB322Driver, TUSB322Mode, AttachedState};
 use tiliqua_hal::persist::Persist;
 
 pub const TIMER0_ISR_PERIOD_MS: u32 = 5;
 
+fn global_index(opts: &Opts, opt: &dyn OptionTrait) -> usize {
+    let key = opt.key().value();
+    opts.all().enumerate()
+        .find(|(_, o)| o.key().value() == key)
+        .expect("cc_map: option key not found").0
+}
+
+fn apply_cc_action(opts: &mut Opts, action: &opts::cc_map::CcAction) {
+    if let Some(opt) = opts.all_mut().nth(action.global_index) {
+        match action.mode {
+            CcMapMode::Absolute => { opt.set_from_cc(action.cc_value); }
+        }
+    }
+}
+
+fn build_cc_mapper(opts: &Opts) -> MidiCcMapper {
+    let mut m = MidiCcMapper::new();
+    // Vector page (CC 20-27)
+    m.add(20, global_index(opts, &opts.vector.x_offset),  CcMapMode::Absolute);
+    m.add(21, global_index(opts, &opts.vector.x_scale),   CcMapMode::Absolute);
+    m.add(22, global_index(opts, &opts.vector.y_offset),  CcMapMode::Absolute);
+    m.add(23, global_index(opts, &opts.vector.y_scale),   CcMapMode::Absolute);
+    m.add(24, global_index(opts, &opts.vector.i_offset),  CcMapMode::Absolute);
+    m.add(25, global_index(opts, &opts.vector.i_scale),   CcMapMode::Absolute);
+    m.add(26, global_index(opts, &opts.vector.c_offset),  CcMapMode::Absolute);
+    m.add(27, global_index(opts, &opts.vector.c_scale),   CcMapMode::Absolute);
+    // Delay page (CC 30-33)
+    m.add(30, global_index(opts, &opts.delay.delay_x),    CcMapMode::Absolute);
+    m.add(31, global_index(opts, &opts.delay.delay_y),    CcMapMode::Absolute);
+    m.add(32, global_index(opts, &opts.delay.delay_i),    CcMapMode::Absolute);
+    m.add(33, global_index(opts, &opts.delay.delay_c),    CcMapMode::Absolute);
+    // Beam page (CC 40-45, CC 41 formerly decay now unused)
+    m.add(40, global_index(opts, &opts.beam.persist),     CcMapMode::Absolute);
+    m.add(42, global_index(opts, &opts.beam.ui_hue),      CcMapMode::Absolute);
+    m.add(43, global_index(opts, &opts.beam.palette),     CcMapMode::Absolute);
+    m.add(44, global_index(opts, &opts.beam.grid),        CcMapMode::Absolute);
+    m.add(45, global_index(opts, &opts.beam.grid_i),      CcMapMode::Absolute);
+    // Misc page (CC 50-52)
+    m.add(50, global_index(opts, &opts.misc.plot_type),   CcMapMode::Absolute);
+    m.add(51, global_index(opts, &opts.misc.plot_src),    CcMapMode::Absolute);
+    m.add(52, global_index(opts, &opts.misc.rotation),    CcMapMode::Absolute);
+    // Scope1 page (CC 60-64)
+    m.add(60, global_index(opts, &opts.scope1.ypos0),     CcMapMode::Absolute);
+    m.add(61, global_index(opts, &opts.scope1.ypos1),     CcMapMode::Absolute);
+    m.add(62, global_index(opts, &opts.scope1.ypos2),     CcMapMode::Absolute);
+    m.add(63, global_index(opts, &opts.scope1.ypos3),     CcMapMode::Absolute);
+    m.add(64, global_index(opts, &opts.scope1.n_channels), CcMapMode::Absolute);
+    // Scope2 page (CC 70-76)
+    m.add(70, global_index(opts, &opts.scope2.yscale),    CcMapMode::Absolute);
+    m.add(71, global_index(opts, &opts.scope2.timebase),  CcMapMode::Absolute);
+    m.add(72, global_index(opts, &opts.scope2.xzoom),     CcMapMode::Absolute);
+    m.add(73, global_index(opts, &opts.scope2.trig_mode), CcMapMode::Absolute);
+    m.add(74, global_index(opts, &opts.scope2.trig_lvl),  CcMapMode::Absolute);
+    m.add(75, global_index(opts, &opts.scope2.intensity), CcMapMode::Absolute);
+    m.add(76, global_index(opts, &opts.scope2.hue),       CcMapMode::Absolute);
+    m
+}
+
 struct App {
     ui: ui::UI<Encoder0, EurorackPmod0, I2c0, Opts>,
+    cc_mapper: MidiCcMapper,
 }
 
 impl App {
@@ -34,9 +99,11 @@ impl App {
         let i2cdev = I2c0::new(peripherals.I2C0);
         let pca9635 = Pca9635Driver::new(i2cdev);
         let pmod = EurorackPmod0::new(peripherals.PMOD0_PERIPH);
+        let cc_mapper = build_cc_mapper(&opts);
         Self {
             ui: ui::UI::new(opts, TIMER0_ISR_PERIOD_MS,
                             encoder, pca9635, pmod),
+            cc_mapper,
         }
     }
 }
@@ -45,6 +112,34 @@ fn timer0_handler(app: &Mutex<RefCell<App>>) {
     critical_section::with(|cs| {
         let mut app = app.borrow_ref_mut(cs);
         app.ui.update();
+
+        // Check for TRS MIDI CC traffic
+        let xbeam = unsafe { pac::XBEAM_PERIPH::steal() };
+        let midi_word = xbeam.midi_read().read().bits();
+        if midi_word != 0 {
+            app.ui.midi_activity();
+            let bytes = [
+                (midi_word & 0xFF) as u8,
+                ((midi_word >> 8) & 0xFF) as u8,
+                ((midi_word >> 16) & 0xFF) as u8,
+            ];
+            if let Ok(msg) = MidiMessage::try_parse_slice(&bytes) {
+                if let MidiMessage::ControlChange(_, cc, val) = msg {
+                    if let Some(action) = app.cc_mapper.process(cc.into(), val.into()) {
+                        if app.ui.opts.misc.cc_highlight.value == CcHighlight::On {
+                            app.ui.opts.select_global(action.global_index);
+                            app.ui.external_modify();
+                        }
+                        apply_cc_action(&mut app.ui.opts, &action);
+                    }
+                }
+            }
+        }
+
+        if app.ui.opts.misc.help.value == HelpPage::Off
+            && app.ui.opts.tracker.page.value == Page::Help {
+            app.ui.opts.tracker.page.value = Page::Vector;
+        }
         app.ui.opts.misc.plot_type.value = match app.ui.opts.tracker.page.value {
             Page::Vector => PlotType::Vector,
             Page::Scope1 => PlotType::Scope,
@@ -131,12 +226,21 @@ fn main() -> ! {
         timer.enable_tick_isr(TIMER0_ISR_PERIOD_MS,
                               pac::Interrupt::TIMER0);
 
-        let vscope    = peripherals.VECTOR_PERIPH;
-        let scope     = peripherals.SCOPE_PERIPH;
+        let mut vscope = Vector0::new(peripherals.VECTOR_PERIPH);
+        let mut scope = Scope0::new(peripherals.SCOPE_PERIPH, 6);
         let xbeam_mux = peripherals.XBEAM_PERIPH;
+        let overlay_periph = peripherals.OVERLAY_PERIPH;
         let mut first = true;
 
         let mut usb_cc_attached = false;
+
+        // Grid overlay operates in DVI pixel space (pre-rotation)
+        let dvi_w = modeline.h_active as u32;
+        let dvi_h = modeline.v_active as u32;
+        overlay_periph.grid_offset().write(|w| unsafe {
+            w.offset_x().bits((dvi_w / 2) as u16);
+            w.offset_y().bits((dvi_h / 2) as u16)
+        });
 
         loop {
 
@@ -176,11 +280,9 @@ fn main() -> ! {
                     v_active,
                     opts.help.scroll.value,
                     opts.beam.ui_hue.value).ok();
-                persist.set_persist(128);
-                persist.set_decay(1);
+                persist.set_persistence(64);
             } else {
-                persist.set_persist(opts.beam.persist.value);
-                persist.set_decay(opts.beam.decay.value);
+                persist.set_persistence(opts.beam.persist.value);
             }
 
 
@@ -201,39 +303,39 @@ fn main() -> ! {
                 });
             }
 
-            vscope.xoffset().write(|w| unsafe { w.value().bits(opts.vector.x_offset.value as u16) } );
-            vscope.yoffset().write(|w| unsafe { w.value().bits(opts.vector.y_offset.value as u16) } );
-            vscope.xscale().write(|w| unsafe { w.scale().bits(0xf-opts.vector.x_scale.value) } );
-            vscope.yscale().write(|w| unsafe { w.scale().bits(0xf-opts.vector.y_scale.value) } );
-            vscope.pscale().write(|w| unsafe { w.scale().bits(0xf-opts.vector.i_scale.value) } );
-            vscope.intensity().write(|w| unsafe { w.intensity().bits(opts.vector.i_offset.value) } );
-            vscope.cscale().write(|w| unsafe { w.scale().bits(0xf-opts.vector.c_scale.value) } );
-            vscope.hue().write(|w| unsafe { w.hue().bits(opts.vector.c_offset.value) } );
+            let (ppd_x, ppd_y) = vscope.pixels_per_div();
+            vscope.set_xoffset_px(opts.vector.x_offset.value * (ppd_x / 4) as i16);
+            vscope.set_yoffset_px(opts.vector.y_offset.value * (ppd_y / 4) as i16);
+            vscope.set_xscale(opts.vector.x_scale.value);
+            vscope.set_yscale(opts.vector.y_scale.value);
+            vscope.set_pscale(opts.vector.i_scale.value);
+            vscope.set_intensity(opts.vector.i_offset.value);
+            vscope.set_cscale(opts.vector.c_scale.value);
+            vscope.set_hue(opts.vector.c_offset.value);
 
-            scope.hue().write(|w| unsafe { w.hue().bits(opts.scope1.hue.value) } );
-            scope.intensity().write(|w| unsafe { w.intensity().bits(opts.scope1.intensity.value) } );
-
-            scope.trigger_lvl().write(|w| unsafe { w.trigger_level().bits(opts.scope1.trig_lvl.value as u16) } );
-            scope.xscale().write(|w| unsafe { w.xscale().bits(0xf-opts.scope1.xscale.value) } );
-            scope.yscale().write(|w| unsafe { w.yscale().bits(0xf-opts.scope1.yscale.value) } );
-            let timebase_value = match opts.scope1.timebase.value {
-                Timebase::Timebase1s    => 3,
-                Timebase::Timebase500ms => 6,
-                Timebase::Timebase250ms => 13,
-                Timebase::Timebase100ms => 32,
-                Timebase::Timebase50ms  => 64,
-                Timebase::Timebase25ms  => 128,
-                Timebase::Timebase10ms  => 320,
-                Timebase::Timebase5ms   => 640,
-                Timebase::Timebase2p5ms => 1280,
-                Timebase::Timebase1ms   => 3200,
+            scope.set_hue(opts.scope2.hue.value);
+            scope.set_intensity(opts.scope2.intensity.value);
+            scope.set_trigger_level(opts.scope2.trig_lvl.value);
+            scope.set_yscale(opts.scope2.yscale.value);
+            let xscale_bits: u8 = match opts.scope2.xzoom.value {
+                XZoom::Half   => 7,
+                XZoom::Normal => 6,
+                XZoom::Double => 5,
             };
-            scope.timebase().write(|w| unsafe { w.timebase().bits(timebase_value) } );
-
-            scope.ypos0().write(|w| unsafe { w.ypos().bits(opts.scope2.ypos0.value as u16) } );
-            scope.ypos1().write(|w| unsafe { w.ypos().bits(opts.scope2.ypos1.value as u16) } );
-            scope.ypos2().write(|w| unsafe { w.ypos().bits(opts.scope2.ypos2.value as u16) } );
-            scope.ypos3().write(|w| unsafe { w.ypos().bits(opts.scope2.ypos3.value as u16) } );
+            scope.set_xscale(xscale_bits);
+            scope.set_timebase(opts.scope2.timebase.value);
+            let (sppd_x, sppd) = scope.pixels_per_div();
+            let n_ch = opts.scope1.n_channels.value;
+            let ypos = [opts.scope1.ypos0.value, opts.scope1.ypos1.value,
+                         opts.scope1.ypos2.value, opts.scope1.ypos3.value];
+            for ch in 0..4u8 {
+                let pos = if ch < n_ch {
+                    ypos[ch as usize] * (sppd / 4) as i16
+                } else {
+                    750 // hide inactive channels off-screen
+                };
+                scope.set_ypos_px(ch.into(), pos);
+            }
 
             // Only connect USB PHY if the TUSB322 Type-C controller says we are attached.
             // This fixes enumeration issues on some machines when using typec <-> typec cables.
@@ -254,6 +356,42 @@ fn main() -> ! {
                       w.usb_connect().bit(usb_cc_attached)
                 } );
 
+            // Update grid spacing. In scope mode use the scope's ppd_x for the
+            // time axis. In portrait rotation the time/signal axes are swapped
+            // relative to DVI x/y.
+            let (scope_ppd_time, scope_ppd_sig) = if opts.misc.plot_type.value == PlotType::Scope {
+                (sppd_x, ppd_y)
+            } else {
+                (ppd_x, ppd_y)
+            };
+            let is_portrait = matches!(opts.misc.rotation.value, Rotate::Left | Rotate::Right);
+            let (dvi_ppd_x, dvi_ppd_y) = if is_portrait {
+                (scope_ppd_sig, scope_ppd_time)
+            } else {
+                (scope_ppd_time, scope_ppd_sig)
+            };
+            overlay_periph.grid_spacing().write(|w| unsafe {
+                w.spacing_x().bits(dvi_ppd_x as u8);
+                w.spacing_y().bits(dvi_ppd_y as u8)
+            });
+            overlay_periph.grid_start().write(|w| unsafe {
+                w.start_x().bits(((dvi_w / 2) % dvi_ppd_x) as u8);
+                w.start_y().bits((((dvi_h / 2) + 1) % dvi_ppd_y) as u8)
+            });
+
+            // Grid overlay style/pixel (changes with options)
+            let grid_style: u8 = if on_help_page { 0 } else {
+                match opts.beam.grid.value {
+                    GridOverlay::Off => 0,
+                    GridOverlay::Grid => 1,
+                    GridOverlay::Cross => 2,
+                }
+            };
+            overlay_periph.flags().write(|w| unsafe {
+                w.grid_style().bits(grid_style);
+                w.grid_pixel().bits(((opts.beam.grid_i.value as u8) << 4) | opts.beam.ui_hue.value)
+            });
+
             xbeam_mux.delay0().write(|w| unsafe { w.value().bits(
                     delay_smoothers[0].proc_u16(opts.delay.delay_x.value)) });
             xbeam_mux.delay1().write(|w| unsafe { w.value().bits(
@@ -267,23 +405,15 @@ fn main() -> ! {
 
 
             if opts.tracker.page.value == Page::Help {
-                scope.flags().write(
-                    |w| w.enable().bit(false) );
-                vscope.flags().write(
-                    |w| w.enable().bit(false) );
+                scope.set_enabled(false, false);
+                vscope.set_enabled(false);
             } else {
                 if opts.misc.plot_type.value == PlotType::Vector {
-                    scope.flags().write(
-                        |w| w.enable().bit(false) );
-                    vscope.flags().write(
-                        |w| w.enable().bit(true) );
+                    scope.set_enabled(false, false);
+                    vscope.set_enabled(true);
                 } else {
-                    scope.flags().write(
-                        |w| { w.enable().bit(true);
-                              w.trigger_always().bit(opts.scope1.trig_mode.value == TriggerMode::Always)
-                        } );
-                    vscope.flags().write(
-                        |w| w.enable().bit(false) );
+                    scope.set_enabled(true, opts.scope2.trig_mode.value == TriggerMode::Always);
+                    vscope.set_enabled(false);
                 }
             }
 

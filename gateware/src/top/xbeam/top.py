@@ -78,6 +78,62 @@ lines, USB streams).  Some usage ideas:
         computer, however it is only part of the signal flow if
         ``usb_mode=enabled`` in the menu system.
 
+The following options are tweakable in the menu. Note that the MIDI TRS input
+can also be used to control most of these through CCs as follows:
+
+    .. code-block:: text
+
+        Page    Parameter     CC  Description
+        ────    ─────────     ──  ───────────
+        HELP    scroll         -  scroll help text up/down
+
+                                  (Hint: to hide HELP page --
+                                   use 'MISC: help' below)
+
+        VECTOR  x-offset      20  in0 (horizontal deflection) offset
+        VECTOR  x-scale       21  in0 (horizontal deflection) volts/div
+        VECTOR  y-offset      22  in1 (vertical deflection) offset
+        VECTOR  y-scale       23  in1 (vertical deflection) volts/div
+        VECTOR  i-offset      24  in2 (beam intensity) offset
+        VECTOR  i-scale       25  in2 (beam intensity CV) scale
+        VECTOR  c-offset      26  in3 (beam color) offset
+        VECTOR  c-scale       27  in4 (beam color CV) scale
+
+        DELAY   delay-x       30  in0/X channel delayline length
+        DELAY   delay-y       31  in1/Y channel delayline length
+        DELAY   delay-i       32  in2/intensity delayline length
+        DELAY   delay-c       33  in3/color delayline length
+
+        BEAM    persist       40  phosphor persistence (high = slow)
+                               -  (CC 41 deprecated)
+        BEAM    ui-hue        42  menu and grid overlay hue
+        BEAM    palette       43  color palette
+        BEAM    grid          44  grid overlay style
+        BEAM    grid-i        45  grid overlay intensity
+
+        MISC    plot-type     50  vectorscope or oscilloscope
+        MISC    plot-src      51  plot inputs or outputs
+        MISC    usb-mode       -  enable/bypass USB audio
+        MISC    rotation      52  screen rotation
+        MISC    help           -  show/hide leftmost help page
+        MISC    cc-highlight   -  highlight changed on CC input
+        MISC    save-opts      -  save all options to flash
+        MISC    wipe-opts      -  reset all options to defaults
+
+        SCOPE1  ypos0         60  channel 0 vertical position
+        SCOPE1  ypos1         61  channel 1 vertical position
+        SCOPE1  ypos2         62  channel 2 vertical position
+        SCOPE1  ypos3         63  channel 3 vertical position
+        SCOPE1  n-channels    64  number of active channels
+
+        SCOPE2  yscale        70  vertical volts/div
+        SCOPE2  timebase      71  horizontal time/div
+        SCOPE2  xzoom         72  horizontal zoom
+        SCOPE2  trig-mode     73  trigger mode
+        SCOPE2  trig-lvl      74  trigger level
+        SCOPE2  intensity     75  trace intensity
+        SCOPE2  hue           76  trace color
+
     .. note::
 
         By default, this core builds for ``48kHz/16bit`` sampling.  However,
@@ -93,16 +149,18 @@ import os
 import sys
 
 from amaranth import *
-from amaranth.lib import data, fifo, stream, wiring
+from amaranth.lib import data, stream, wiring
+from amaranth.lib.fifo import SyncFIFOBuffered
 from amaranth.lib.wiring import In, Out, connect, flipped
 from amaranth_soc import csr
 
-from tiliqua import dsp, usb_audio
+from tiliqua import dsp, midi, usb_audio
 from tiliqua.build import sim
 from tiliqua.build.cli import top_level_cli
 from tiliqua.build.types import BitstreamHelp
 from tiliqua.periph import eurorack_pmod
-from tiliqua.raster import scope
+from tiliqua.periph import overlay
+from tiliqua.raster import PSQ, scope
 from tiliqua.raster.plot import FramebufferPlotter
 from tiliqua.tiliqua_soc import TiliquaSoc
 
@@ -117,6 +175,9 @@ class XbeamPeripheral(wiring.Component):
     class Delay(csr.Register, access="w"):
         value:   csr.Field(csr.action.W, unsigned(16))
 
+    class MidiRead(csr.Register, access="r"):
+        msg: csr.Field(csr.action.R, unsigned(32))
+
     def __init__(self):
         regs = csr.Builder(addr_width=5, data_width=8)
         self._flags = regs.add("flags", self.Flags(), offset=0x0)
@@ -124,6 +185,7 @@ class XbeamPeripheral(wiring.Component):
         self._delay1 = regs.add("delay1", self.Delay(), offset=0x8)
         self._delay2 = regs.add("delay2", self.Delay(), offset=0xC)
         self._delay3 = regs.add("delay3", self.Delay(), offset=0x10)
+        self._midi_read = regs.add("midi_read", self.MidiRead(), offset=0x14)
         self._bridge = csr.Bridge(regs.as_memory_map())
         super().__init__({
             "usb_en": Out(1),
@@ -134,6 +196,9 @@ class XbeamPeripheral(wiring.Component):
             # Streams in/out of plotting delay lines
             "delay_i": In(stream.Signature(data.ArrayLayout(eurorack_pmod.ASQ, 4))),
             "delay_o": Out(stream.Signature(data.ArrayLayout(eurorack_pmod.ASQ, 4))),
+
+            # TRS MIDI input
+            "i_midi": In(stream.Signature(midi.MidiMessage)),
         })
         self.bus.memory_map = self._bridge.bus.memory_map
 
@@ -172,12 +237,26 @@ class XbeamPeripheral(wiring.Component):
             with m.If(field.f.value.w_stb):
                 m.d.sync += delay[ch].eq(field.f.value.w_data)
 
+        # TRS MIDI -> SoC read FIFO
+        m.submodules.read_midi_fifo = read_midi_fifo = SyncFIFOBuffered(
+            width=24, depth=8)
+        m.d.comb += [
+            self.i_midi.ready.eq(1),
+            read_midi_fifo.w_data.eq(self.i_midi.payload),
+            read_midi_fifo.w_en.eq(self.i_midi.valid),
+            read_midi_fifo.r_en.eq(self._midi_read.element.r_stb),
+        ]
+        with m.If(read_midi_fifo.r_level != 0):
+            m.d.comb += self._midi_read.f.msg.r_data.eq(read_midi_fifo.r_data)
+        with m.Else():
+            m.d.comb += self._midi_read.f.msg.r_data.eq(0)
+
         return m
 
 class XbeamSoc(TiliquaSoc):
 
     # Used by `tiliqua_soc.py` to create a MODULE_DOCSTRING rust constant used by the 'help' page.
-    __doc__ = sys.modules[__name__].__doc__
+    module_docstring = sys.modules[__name__].__doc__
 
     # Stored in manifest and used by bootloader for brief summary of each bitstream.
     bitstream_help = BitstreamHelp(
@@ -188,32 +267,41 @@ class XbeamSoc(TiliquaSoc):
 
     def __init__(self, **kwargs):
 
+        self.overlay_periph = overlay.Peripheral()
+
         # don't finalize the CSR bridge in TiliquaSoc, we're adding more peripherals.
-        super().__init__(finalize_csr_bridge=False, **kwargs)
+        super().__init__(finalize_csr_bridge=False,
+                         fb_overlay=self.overlay_periph.overlay, **kwargs)
 
         # Extract module docstring for help page
 
         self.vector_periph_base = 0x00001000
         self.scope_periph_base  = 0x00001100
         self.xbeam_periph_base  = 0x00001200
+        self.overlay_periph_base = 0x00001300
 
         # Dedicated framebuffer plotter for scope peripherals (5 ports: 1 vector + 4 scope channels)
         self.plotter = FramebufferPlotter(
             bus_signature=self.psram_periph.bus.signature.flip(), n_ports=5)
         self.psram_periph.add_master(self.plotter.bus)
 
-        # Vectorscope with upsampling and CSR registers
-        self.vector_periph = scope.VectorPeripheral(
-            n_upsample=8)
+        self.n_upsample = 8 if self.clock_settings.audio_clock.is_192khz() else 32
+
+        # Vectorscope with CSR registers
+        self.vector_periph = scope.VectorPeripheral()
         self.csr_decoder.add(self.vector_periph.bus, addr=self.vector_periph_base, name="vector_periph")
 
         # 4-ch oscilloscope with CSR registers
-        self.scope_periph = scope.ScopePeripheral()
+        self.scope_periph = scope.ScopePeripheral(
+            fs=self.clock_settings.audio_clock.fs() * self.n_upsample)
         self.csr_decoder.add(self.scope_periph.bus, addr=self.scope_periph_base, name="scope_periph")
 
         # Extra peripheral for some global control flags.
         self.xbeam_periph = XbeamPeripheral()
         self.csr_decoder.add(self.xbeam_periph.bus, addr=self.xbeam_periph_base, name="xbeam_periph")
+
+        # Grid overlay peripheral
+        self.csr_decoder.add(self.overlay_periph.bus, addr=self.overlay_periph_base, name="overlay_periph")
 
         # now we can freeze the memory map
         self.finalize_csr_bridge()
@@ -229,13 +317,14 @@ class XbeamSoc(TiliquaSoc):
         m.submodules.vector_periph = self.vector_periph
         m.submodules.scope_periph = self.scope_periph
         m.submodules.xbeam_periph = self.xbeam_periph
+        m.submodules.overlay_periph = self.overlay_periph
 
         # Connect vector/scope pixel requests to plotter channels
         wiring.connect(m, self.vector_periph.o, self.plotter.i[0])
         for n in range(4):
             wiring.connect(m, self.scope_periph.o[n], self.plotter.i[n+1])
 
-        # Connect framebuffer propreties to plotter backend
+        # Connect framebuffer properties to plotter backend
         wiring.connect(m, wiring.flipped(self.fb.fbp), self.plotter.fbp)
 
         # FIXME: bit of a hack so we can pluck out peripherals from `tiliqua_soc`
@@ -249,6 +338,14 @@ class XbeamSoc(TiliquaSoc):
             # SoC-controlled USB PHY connection (based on typeC CC status)
             m.d.comb += usbif.usb_connect.eq(self.xbeam_periph.usb_connect)
 
+            # TRS MIDI
+            midi_pins = platform.request("midi")
+            m.submodules.serialrx = serialrx = midi.SerialRx(
+                    system_clk_hz=60e6, pins=midi_pins)
+            m.submodules.midi_decode = midi_decode = midi.MidiDecodeSerial()
+            wiring.connect(m, serialrx.o, midi_decode.i)
+            wiring.connect(m, midi_decode.o, self.xbeam_periph.i_midi)
+
         with m.If(self.xbeam_periph.usb_en):
             if sim.is_hw(platform):
                 wiring.connect(m, pmod0.o_cal, usbif.i)
@@ -260,18 +357,28 @@ class XbeamSoc(TiliquaSoc):
 
         wiring.connect(m, self.xbeam_periph.delay_o, pmod0.i_cal)
 
-        m.submodules.plot_fifo = plot_fifo = fifo.SyncFIFOBuffered(
-            width=data.ArrayLayout(eurorack_pmod.ASQ, 4).as_shape().width, depth=256)
+        m.submodules.plot_fifo = plot_fifo = dsp.SyncFIFOBuffered(
+            shape=data.ArrayLayout(PSQ, 4), depth=256)
 
         with m.If(self.xbeam_periph.show_outputs):
-            dsp.connect_peek(m, pmod0.i_cal, plot_fifo.w_stream)
+            dsp.connect_peek(m, pmod0.i_cal, plot_fifo.i)
         with m.Else():
-            dsp.connect_peek(m, pmod0.o_cal, plot_fifo.w_stream)
+            dsp.connect_peek(m, pmod0.o_cal, plot_fifo.i)
+
+        # Upsample all 4 channels before routing to scope/vector peripherals
+        fs = self.clock_settings.audio_clock.fs()
+        m.submodules.up_split4 = up_split4 = dsp.Split(n_channels=4, source=plot_fifo.o, shape=PSQ)
+        m.submodules.up_merge4 = up_merge4 = dsp.Merge(n_channels=4, shape=PSQ)
+        for ch in range(4):
+            r = dsp.Resample(fs_in=fs, n_up=self.n_upsample, m_down=1, shape=PSQ)
+            setattr(m.submodules, f"resample{ch}", r)
+            wiring.connect(m, up_split4.o[ch], r.i)
+            wiring.connect(m, r.o, up_merge4.i[ch])
 
         with m.If(self.scope_periph.soc_en):
-            wiring.connect(m, plot_fifo.r_stream, self.scope_periph.i)
+            wiring.connect(m, up_merge4.o, self.scope_periph.i)
         with m.Else():
-            wiring.connect(m, plot_fifo.r_stream, self.vector_periph.i)
+            wiring.connect(m, up_merge4.o, self.vector_periph.i)
 
         return m
 

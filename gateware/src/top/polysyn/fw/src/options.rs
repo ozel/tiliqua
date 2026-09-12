@@ -3,15 +3,17 @@ use strum_macros::{EnumIter, IntoStaticStr};
 use serde_derive::{Serialize, Deserialize};
 
 use tiliqua_lib::palette::ColorPalette;
+use tiliqua_lib::scope::VScale;
 
 #[derive(Default, Clone, Copy, PartialEq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
 #[strum(serialize_all = "SCREAMING-KEBAB-CASE")]
 pub enum Page {
     #[default]
     Help,
-    Poly,
+    Voice,
+    Adsr,
+    Effect,
     Beam,
-    Vector,
     Misc,
 }
 
@@ -21,6 +23,33 @@ pub enum TouchControl {
     Off,
     #[default]
     On,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
+#[strum(serialize_all = "kebab-case")]
+pub enum Waveform {
+    #[default]
+    Saw,
+    Tri,
+    Sine,
+    Square,
+    Organ,
+    Pulse,
+    Comb,
+    Formant,
+    OvSine,
+    Strng,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
+#[strum(serialize_all = "kebab-case")]
+pub enum ProcMode {
+    #[default]
+    Off,
+    Sat,
+    Fold,
+    Rect,
+    Crush,
 }
 
 #[derive(Default, Clone, Copy, PartialEq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
@@ -39,17 +68,49 @@ pub enum UsbMidiSerialDebug {
     On,
 }
 
+#[derive(Default, Clone, Copy, PartialEq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
+#[strum(serialize_all = "kebab-case")]
+pub enum CcHighlight {
+    Off,
+    #[default]
+    On,
+}
+
+#[repr(u8)]
+#[derive(Default, Clone, Copy, PartialEq, EnumIter, IntoStaticStr, Serialize, Deserialize)]
+#[strum(serialize_all = "kebab-case")]
+pub enum MidiChannel {
+    #[default]
+    All,
+    Ch1,  Ch2,  Ch3,  Ch4,
+    Ch5,  Ch6,  Ch7,  Ch8,
+    Ch9,  Ch10, Ch11, Ch12,
+    Ch13, Ch14, Ch15, Ch16,
+}
+
+impl MidiChannel {
+    pub fn to_filter(self) -> Option<u8> {
+        match self {
+            /// HAL wants `None` => for listening on all channels.
+            MidiChannel::All => None,
+            _ => Some(self as u8),
+        }
+    }
+}
+
 int_params!(PageNumParams<u16>    { step: 1, min: 0, max: 0 });
-int_params!(DriveParams<u16>      { step: 2048, min: 0, max: 32768 });
-int_params!(ResoParams<u16>       { step: 2048, min: 8192, max: 32768 });
-int_params!(DiffuseParams<u16>    { step: 2048, min: 0, max: 32768 });
-int_params!(PersistParams<u16>    { step: 32, min: 32, max: 4096 });
-int_params!(DecayParams<u8>       { step: 1, min: 0, max: 15 });
+int_params!(ProcAmtParams<u16>   { step: 1, min: 0, max: 50, format: IntFormat::Scaled { divisor: 10, precision: 1, suffix: "" } });
+int_params!(DriveParams<u16>    { step: 2048, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
+int_params!(ResoParams<u16>       { step: 2048, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
+int_params!(DiffuseParams<u16>    { step: 2048, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
+int_params!(AdsrTimeParams<u16>  { step: 1024, min: 0, max: 16384, format: IntFormat::Scaled { divisor: 16384, precision: 2, suffix: "" } });
+int_params!(AdsrLevelParams<u16> { step: 1024, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
+int_params!(PersistParams<u8>     { step: 1, min: 1, max: 80 });
 int_params!(IntensityParams<u8>   { step: 1, min: 0, max: 15 });
 int_params!(HueParams<u8>         { step: 1, min: 0, max: 15 });
-int_params!(XScaleParams<u8>      { step: 1, min: 0, max: 15 });
-int_params!(YScaleParams<u8>      { step: 1, min: 0, max: 15 });
-int_params!(ScrollParams<u8>      { step: 1, min: 0, max: 60 });
+int_params!(ScrollParams<u8>      { step: 1, min: 0, max: 125 });
+int_params!(LfoRateParams<u16>   { step: 2, min: 0, max: 50, format: IntFormat::Scaled { divisor: 10, precision: 1, suffix: "hz" } });
+int_params!(LfoDepthParams<u16>  { step: 2048, min: 0, max: 32768, format: IntFormat::Scaled { divisor: 32768, precision: 2, suffix: "" } });
 
 button_params!(OneShotButtonParams { mode: ButtonMode::OneShot });
 
@@ -60,31 +121,47 @@ pub struct HelpOpts {
 }
 
 #[derive(OptionPage, Clone)]
-pub struct PolyOpts {
+pub struct VoiceOpts {
     #[option]
-    pub touch_control: EnumOption<TouchControl>,
-    #[option(16384)]
-    pub drive: IntOption<DriveParams>,
+    pub waveform: EnumOption<Waveform>,
+    #[option]
+    pub proc: EnumOption<ProcMode>,
+    #[option(10)]
+    pub proc_amt: IntOption<ProcAmtParams>,
     #[option(16384)]
     pub reso: IntOption<ResoParams>,
+    #[option(1)]
+    pub lfo_rate: IntOption<LfoRateParams>,
+    #[option(3277)]
+    pub lfo_depth: IntOption<LfoDepthParams>,
+}
+
+#[derive(OptionPage, Clone)]
+pub struct EffectOpts {
+    #[option(8192)]
+    pub drive: IntOption<DriveParams>,
     #[option(12288)]
     pub diffuse: IntOption<DiffuseParams>,
 }
 
 #[derive(OptionPage, Clone)]
-pub struct VectorOpts {
-    #[option(6)]
-    pub xscale: IntOption<XScaleParams>,
-    #[option(6)]
-    pub yscale: IntOption<YScaleParams>,
+pub struct AdsrOpts {
+    #[option(0)]
+    pub attack: IntOption<AdsrTimeParams>,
+    #[option(4096)]
+    pub decay: IntOption<AdsrTimeParams>,
+    #[option(16384)]
+    pub sustain: IntOption<AdsrLevelParams>,
+    #[option(4096)]
+    pub release: IntOption<AdsrTimeParams>,
 }
 
 #[derive(OptionPage, Clone)]
 pub struct BeamOpts {
-    #[option(64)]
+    #[option(VScale::Scale2V)]
+    pub scale: EnumOption<VScale>,
+    #[option(15)]
     pub persist: IntOption<PersistParams>,
-    #[option(2)]
-    pub decay: IntOption<DecayParams>,
     #[option(8)]
     pub intensity: IntOption<IntensityParams>,
     #[option(10)]
@@ -95,6 +172,12 @@ pub struct BeamOpts {
 
 #[derive(OptionPage, Clone)]
 pub struct MiscOpts {
+    #[option]
+    pub touch_ctrl: EnumOption<TouchControl>,
+    #[option]
+    pub cc_highlight: EnumOption<CcHighlight>,
+    #[option]
+    pub midi_ch: EnumOption<MidiChannel>,
     #[option]
     pub usb_host: EnumOption<UsbHost>,
     #[option]
@@ -110,12 +193,14 @@ pub struct Opts {
     pub tracker: ScreenTracker<Page>,
     #[page(Page::Help)]
     pub help: HelpOpts,
-    #[page(Page::Poly)]
-    pub poly: PolyOpts,
+    #[page(Page::Voice)]
+    pub voice: VoiceOpts,
+    #[page(Page::Adsr)]
+    pub adsr: AdsrOpts,
+    #[page(Page::Effect)]
+    pub effect: EffectOpts,
     #[page(Page::Beam)]
     pub beam: BeamOpts,
-    #[page(Page::Vector)]
-    pub vector: VectorOpts,
     #[page(Page::Misc)]
     pub misc: MiscOpts,
 }

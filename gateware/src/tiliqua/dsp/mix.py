@@ -2,6 +2,8 @@
 #
 # SPDX-License-Identifier: CERN-OHL-S-2.0
 
+import enum
+
 from amaranth import *
 from amaranth.lib import data, stream, wiring
 from amaranth.lib.memory import Memory
@@ -11,28 +13,70 @@ from amaranth.utils import exact_log2
 from amaranth_future import fixed
 
 from . import ASQ, mac
+from .block import Block
+
+
+class CoeffUpdate(enum.Enum):
+    NONE  = "none"
+    XY    = "xy"
+    BLOCK = "block"
 
 
 class MatrixMix(wiring.Component):
 
     """
-    Matrix mixer with tunable coefficients and configurable
-    input & output channel count. Uses a single multiplier.
+    ``MatrixMix`` takes a stream of samples ``i_channels`` wide and emits
+    a stream ``o_channels`` wide. The input channels are multiplied by a
+    matrix of ``i_channels*o_channels`` coefficients, which may be static
+    or dynamically updated through gateware.
 
-    Coefficients must fit inside the self.ctype declared below.
-    Coefficients can be updated in real-time by writing them
-    to the `c` stream (position `o_x`, `i_y`, value `v`).
+    A single multiplier is shared, where total latency is of the order
+    ``2*i_channels*o_channels`` from input to output.
+
+    All coefficients must fit inside the self.ctype declared below.
+
+    Coefficients may be updated dynamically, depending on ``coeff_update``:
+
+    - ``CoeffUpdate.NONE``:  No update port.
+    - ``CoeffUpdate.XY``:    Stream of ``(o_x, i_y, v)`` updates.
+    - ``CoeffUpdate.BLOCK``: Block stream, mapped row-major to coefficients.
+
+    Members
+    -------
+    i : :py:`In(stream.Signature(data.ArrayLayout(ASQ, i_channels)))`
+        Input stream for sending sample arrays to the mixer.
+
+    o : :py:`In(stream.Signature(data.ArrayLayout(ASQ, o_channels)))`
+        Output stream for fetching sample arrays from the mixer.
+
+    c : :py:`In(stream.Signature(...))`
+        Optional coefficient update port, type depends on ``self.coeff_update``.
     """
 
-    def __init__(self, i_channels, o_channels, coefficients):
+    def __init__(self, i_channels, o_channels, coefficients,
+                 coeff_update=CoeffUpdate.XY, ctype=mac.SQNative):
+        """
+        i_channels : int
+            Number of input channels.
+        o_channels : int
+            Number of output channels
+        coefficients : [[float]]
+            Nested array of static matrix coefficients, used as initial values
+            of the coefficient memory.
+        coeff_update : CoeffUpdate
+            Whether a dynamic coefficient update port should be added (see above).
+        ctype : fixed.SQ
+            Fixed-point type of coefficients in the coefficient ROM.
+        """
 
         assert(len(coefficients)       == i_channels)
         assert(len(coefficients[0])    == o_channels)
 
         self.i_channels = i_channels
         self.o_channels = o_channels
+        self.coeff_update = coeff_update
 
-        self.ctype = mac.SQNative
+        self.ctype = ctype
 
         coefficients_flat = [
             fixed.Const(x, shape=self.ctype)
@@ -47,15 +91,21 @@ class MatrixMix(wiring.Component):
             shape=self.ctype,
             depth=i_channels*o_channels, init=coefficients_flat)
 
-        super().__init__({
+        ports = {
             "i": In(stream.Signature(data.ArrayLayout(ASQ, i_channels))),
-            "c": In(stream.Signature(data.StructLayout({
+            "o": Out(stream.Signature(data.ArrayLayout(ASQ, o_channels))),
+        }
+
+        if coeff_update == CoeffUpdate.XY:
+            ports["c"] = In(stream.Signature(data.StructLayout({
                 "o_x": unsigned(exact_log2(self.o_channels)),
                 "i_y": unsigned(exact_log2(self.i_channels)),
                 "v":   self.ctype
-                }))),
-            "o": Out(stream.Signature(data.ArrayLayout(ASQ, o_channels))),
-        })
+            })))
+        elif coeff_update == CoeffUpdate.BLOCK:
+            ports["c"] = In(stream.Signature(Block(ASQ)))
+
+        super().__init__(ports)
 
     def elaborate(self, platform):
         m = Module()
@@ -85,18 +135,31 @@ class MatrixMix(wiring.Component):
 
         # coefficient update logic
 
-        with m.If(self.c.ready):
+        if self.coeff_update == CoeffUpdate.XY:
             m.d.comb += [
+                self.c.ready.eq(1),
                 wport.addr.eq(Cat(self.c.payload.o_x, self.c.payload.i_y)),
                 wport.en.eq(self.c.valid),
                 wport.data.eq(self.c.payload.v),
             ]
+        elif self.coeff_update == CoeffUpdate.BLOCK:
+            blk_ix_reg = Signal(range(self.i_channels * self.o_channels))
+            blk_ix = Signal.like(blk_ix_reg)
+            m.d.comb += blk_ix.eq(
+                Mux(self.c.payload.first, 0, blk_ix_reg))
+            m.d.comb += [
+                self.c.ready.eq(1),
+                wport.addr.eq(blk_ix),
+                wport.en.eq(self.c.valid),
+                wport.data.eq(self.c.payload.sample),
+            ]
+            with m.If(self.c.valid):
+                m.d.sync += blk_ix_reg.eq(blk_ix + 1)
 
         # main multiplications state machine
 
         with m.FSM() as fsm:
             with m.State('WAIT-VALID'):
-                m.d.comb += self.c.ready.eq(1), # permit coefficient updates
                 m.d.comb += self.i.ready.eq(1),
                 with m.If(self.i.valid):
                     m.d.sync += [
@@ -138,12 +201,11 @@ class MatrixMix(wiring.Component):
                     m.next = 'LATCH'
             with m.State('LATCH'):
                 m.d.sync += [
-                    self.o.payload[n].eq(o_accum[n])
+                    self.o.payload[n].eq(o_accum[n].saturate(ASQ))
                     for n in range(self.o_channels)
                 ]
                 m.next = 'WAIT-READY'
             with m.State('WAIT-READY'):
-                m.d.comb += self.c.ready.eq(1), # permit coefficient updates
                 m.d.comb += [
                     self.o.valid.eq(1),
                 ]

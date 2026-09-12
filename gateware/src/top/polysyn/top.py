@@ -2,37 +2,40 @@
 #
 # SPDX-License-Identifier: CERN-OHL-S-2.0
 """
-8-voice polyphonic synthesizer with video display and menu system.
+8-voice touch/MIDI polysynth with scope.
 
     .. code-block:: text
 
         Pitch / Touch         Audio / CV
                      ┌────┐
         C2    touch0 │in0 │◄─ phase modulation
-        G2    touch1 │in1 │◄─ -
-        C3    touch2 │in2 │◄─ -
+        G2    touch1 │in1 │◄─ filter envelope
+        C3    touch2 │in2 │◄─ drive
         Eb3   touch3 │in3 │◄─ -
                      └────┘
                      ┌────┐
         G3    touch4 │out0│─► -
-        C4    touch5 │out1│─► -
+        C4    touch5 │out1│─► MIDI CLK
         -     touch6 │out2│─► audio out (L)
         -     touch7 │out3│─► audio out (R)
                      └────┘
 
-The synthesizer can be controlled through touching jacks 0-5 or using a MIDI
-keyboard (TRS MIDI or USB host is supported). The control source must be
-selected in the menu system.
+Voices are controlled through touching jacks 0-5 or using a MIDI keyboard
+(TRS MIDI or USB host is supported). The control source must be selected in
+the menu system (MISC page).
 
-    - Output audio is sent to output channels 2 and 3 (last 2 jacks).
+    - Voice mix is sent to output channels 2 and 3 (last 2 jacks).
 
-    - In touch mode, the touch magnitude controls the filter envelopes of each
-      voice. In MIDI mode, the velocity of each note as well as the value of the
-      modulation wheel affects the filter envelopes.
+    - For touch, the touch magnitude controls the filter envelopes of each
+      voice. For MIDI, the velocity of each note and mod wheel affects the
+      filter envelopes.
 
-    - Input jack 0 also controls phase modulation of all oscillators, so you can
-      patch input jack 0 to an LFO for retro-sounding slow vibrato, or to an
-      oscillator for some wierd FM effects.
+    - When a jack is patched into input 0, 1 or 2, CV can be used to modulate
+      all voices simultaneously up to audio rate (phase mod, filter cutoff and
+      drive). Inputs 1 and 2 act as bipolar offsets on top of the existing
+      envelope / knob value. Patch an LFO into phase CV for retro 'tape-wow'
+      like detuning. Patch an oscillator into phase CV for FM effects, or into
+      drive for AM effect.
 
 Each voice is hard panned left or right in the stereo field, with 2 end-of-chain
 effects: distortion and diffusion (delay), both of which can be mixed in with
@@ -45,9 +48,14 @@ the UI.
                 ┌─────▼─▼─────┐
         touch──►│Voice Tracker├──►┌─────────┐
                 └─────────────┘   │ Voices  │
-                    ┌─────────┐   │  (x8)   │ (resonance =
-             cv in0─►Phase Mod├──►│NCO + SVF│ (`reso` setting)
-                    └─────────┘   └─────────┘
+                                  │  (x8)   │
+                                  │         │
+                                  │ Wavetbl │
+                                  │    ▼    │
+                                  │  ADSR   │ (ADSR sets filter cutoff)
+                                  │    ▼    │
+                                  │ Filter  │ (resonance =
+                                  └─────────┘  `reso` setting)
                                   ┌────▼────┐
                                   │Mix L/R  │
                                   │(stereo) │
@@ -63,6 +71,57 @@ the UI.
                                   │OUT (4x)├──────► out2 (L)
                                   └────────┴──────► out3 (R)
 
+The VOICE page allows selection between many wavetables. The 'proc' option
+allows applying effects (e.g. saturation, wavefolding, rectify) to
+the wavetable **before** it hits the voice filter. When no CV is patched
+into input 0, a built-in sine LFO modulates the phase of all voices
+(rate and depth are adjustable on the VOICE page).
+
+If a MIDI clock is present on TRS or USB MIDI, it is divided by 24 (1PPQN)
+and sent out on output jack 1. STOP/START/CONTINUE is respected. The LED
+will pulse with the clock ONLY if that jack is connected.
+
+The following options are tweakable in the menu. Note that the USB/TRS MIDI
+can also be used to control most of these through CCs as follows:
+
+    .. code-block:: text
+
+        Page    Parameter     CC  Description
+        ────    ─────────     ──  ───────────
+        HELP    scroll         -  scroll help text up/down
+
+        VOICE   waveform      20  wavetable selection
+        VOICE   proc          21  wavetable processing mode
+        VOICE   proc-amt      22  wavetable processing amount
+        VOICE   reso          23  filter resonance
+        VOICE   lfo-rate      24  phase modulation LFO rate
+        VOICE   lfo-depth     25  phase modulation LFO depth
+
+        ADSR    attack        30  filter envelope attack
+        ADSR    decay         31  filter envelope decay
+        ADSR    sustain       32  filter envelope sustain
+        ADSR    release       33  filter envelope release
+
+        EFFECT  drive         40  distortion amount
+        EFFECT  diffuse       41  diffusion wet/dry mix
+
+        BEAM    scale         50  vectorscope volts/div
+        BEAM    persist       51  phosphor persistence (high = slow)
+                               -  (CC 52 deprecated)
+        BEAM    intensity     53  trace intensity
+        BEAM    hue           54  trace and menu hue
+        BEAM    palette       55  color palette
+
+        MISC    touch-ctrl     -  enable/disable jacktouch input
+        MISC    cc-highlight   -  highlight changed on CC input
+        MISC    midi-ch        -  filter MIDI to specific channel (default: all)
+        MISC    usb-host       -  enable USB host MIDI (disables TRS)
+        MISC    serial-debug   -  dump MIDI data out serial port
+        MISC    save-opts      -  save all options to flash
+        MISC    wipe-opts      -  reset all options to defaults
+
+    MIDI CC 1 (mod wheel) controls filter cutoff. CC 64 (sustain
+    pedal) holds voices. Pitch bend is also supported.
 
 """
 
@@ -76,6 +135,8 @@ from amaranth.lib.fifo import SyncFIFOBuffered
 from amaranth.lib.wiring import In, Out, connect, flipped
 from amaranth_soc import csr
 
+from amaranth_future import fixed
+
 from guh.engines.midi import USBMIDIHost
 
 from tiliqua import dsp, midi
@@ -83,7 +144,7 @@ from tiliqua.build import sim
 from tiliqua.build.cli import top_level_cli
 from tiliqua.build.types import BitstreamHelp
 from tiliqua.dsp import ASQ
-from tiliqua.raster import scope
+from tiliqua.raster import PSQ, scope
 from tiliqua.raster.plot import FramebufferPlotter
 from tiliqua.tiliqua_soc import TiliquaSoc
 
@@ -133,124 +194,130 @@ class PolySynth(wiring.Component):
 
     drive: In(unsigned(16))
     reso: In(unsigned(16))
+    attack_rate: In(dsp.MultiADSR.EnvUQ)
+    decay_rate: In(dsp.MultiADSR.EnvUQ)
+    sustain_level: In(dsp.MultiADSR.EnvUQ)
+    release_rate: In(dsp.MultiADSR.EnvUQ)
+
+    # Wavetable write port (firmware fills via CSR)
+    wt_write_addr: In(unsigned(9))
+    wt_write_data: In(signed(16))
+    wt_write_en: In(unsigned(1))
+
+    lfo: In(ASQ)
+
+    # Jack detection (directly from pmod hardware)
+    jack: In(unsigned(8))
 
     voice_states: Out(midi.MidiVoice).array(N_VOICES)
+    voice_cutoffs: Out(unsigned(8)).array(N_VOICES)
+
+    def __init__(self):
+        super().__init__()
 
     def elaborate(self, platform):
         m = Module()
 
-        # supported simultaneous voices
         n_voices = self.N_VOICES
 
         m.submodules.voice_tracker = voice_tracker = midi.MidiVoiceTracker(
-            max_voices=n_voices, velocity_mod=True, zero_velocity_gate=True)
-        # 1 oscillator and filter per oscillator
-        ncos = [dsp.SawNCO(shift=0) for _ in range(n_voices)]
-
-        # All SVFs share the same multiplier tile through a RingMAC.
-        m.submodules.server = server = dsp.mac.RingMACServer()
-        svfs = [dsp.SVF(macp=server.new_client()) for _ in range(n_voices)]
-
-        m.submodules.merge = merge = dsp.Merge(n_channels=n_voices)
-
-        dsp.named_submodules(m.submodules, ncos)
-        dsp.named_submodules(m.submodules, svfs)
+            max_voices=n_voices, velocity_mod=True, zero_velocity_gate=False)
 
         # Connect MIDI stream -> voice tracker
         wiring.connect(m, wiring.flipped(self.i_midi), voice_tracker.i)
 
-        # analog ins
-        m.submodules.cv_in = cv_in = dsp.Split(
-                n_channels=4, source=wiring.flipped(self.i))
-        cv_in.wire_ready(m, [2, 3])
+        m.submodules.voice_block = voice_block = dsp.VoiceBlock(n_voices=n_voices)
 
+        # latch CV ins
+        cv = Signal.like(self.i.payload)
+        m.d.comb += self.i.ready.eq(1)
+        with m.If(self.i.valid):
+            m.d.sync += cv.eq(self.i.payload)
+
+        m.submodules.lfo_lpf = lfo_lpf = dsp.OnePole()
+        m.d.comb += [
+            lfo_lpf.i.payload.eq(self.lfo),
+            lfo_lpf.i.valid.eq(self.i.valid),
+            lfo_lpf.o.ready.eq(1),
+            lfo_lpf.shift.eq(6),
+        ]
+
+        # CV 0: phase modulation (when jack 0 patched, otherwise use LFO)
+        m.d.comb += voice_block.phase_mod.eq(
+            Mux(self.jack[0], cv[0], lfo_lpf.o.payload))
+
+        # CV 2: drive bipolar offset (when jack 2 patched)
+        SQDrive = dsp.mac.SQNative  # SQ(3, 15)
+        drive_base = Signal(SQDrive)
+        m.d.comb += drive_base.as_value().eq(self.drive << 2)
+        drive_sum = drive_base + cv[2]
+        drive_val = Signal(SQDrive)
+        m.d.comb += drive_val.eq(drive_sum.saturate(SQDrive))
+
+        # per-voice params
         for n in range(n_voices):
-
-            m.d.comb += self.voice_states[n].eq(voice_tracker.o[n])
-
-            # Connect audio in -> NCO.i
-            dsp.connect_remap(m, cv_in.o[0], ncos[n].i, lambda o, i : [
-                # For fun, phase mod on audio in #0
-                i.payload.phase   .eq(o.payload),
-                i.payload.freq_inc.eq(voice_tracker.o[n].freq_inc)
-            ])
-
-            # Simple counting smoother for the filter cutoff.
-            follower = dsp.CountingFollower(bits=8)
-            m.submodules += follower
+            # CV 1: filter envelope bipolar offset (when jack 1 patched)
+            vel_base = fixed.UQ(0, 8)(voice_tracker.o[n].velocity_mod)
+            vel_sum = vel_base + cv[1]
+            vel_out = Signal(dsp.MultiADSR.EnvUQ, name=f"vel_out_{n}")
+            m.d.comb += vel_out.eq(vel_sum.saturate(dsp.MultiADSR.EnvUQ))
             m.d.comb += [
-                follower.i.valid.eq(cv_in.o[0].valid), # hack to clock at audio rate
-                follower.i.payload.eq(voice_tracker.o[n].velocity_mod),
-                follower.o.ready.eq(1)
+                self.voice_states[n].eq(voice_tracker.o[n]),
+                self.voice_cutoffs[n].eq(voice_block.voice_cutoffs[n]),
+                voice_block.voice_gates[n].eq(voice_tracker.o[n].gate),
+                voice_block.voice_freq_incs[n].eq(voice_tracker.o[n].freq_inc),
+                voice_block.voice_velocity[n].eq(vel_out),
+                voice_tracker.voice_active[n].eq(voice_block.voice_active[n]),
             ]
 
-            # Connect voice.vel and NCO.o -> SVF.
-            dsp.connect_remap(m, ncos[n].o, svfs[n].i, lambda o, i : [
-                i.payload.x                    .eq(o.payload >> 1),
-                i.payload.resonance.as_value().eq(self.reso),
-                i.payload.cutoff               .eq(follower.o.payload << 5)
-            ])
-
-            # Connect SVF LPF -> merge channel
-            dsp.connect_remap(m, svfs[n].o, merge.i[n], lambda o, i : [
-                i.payload.eq(o.payload.lp),
-            ])
-
-        # Voice mixdown to stereo. Alternate left/right
-        o_channels = 2
-        coefficients = [[0.75*o_channels/n_voices, 0.0                ],
-                        [0.0,                      0.75*o_channels/n_voices]] * (n_voices // 2)
-        m.submodules.matrix_mix = matrix_mix = dsp.MatrixMix(
-            i_channels=n_voices, o_channels=o_channels,
-            coefficients=coefficients)
-        wiring.connect(m, merge.o, matrix_mix.i),
+        # global params
+        m.d.comb += [
+            voice_block.reso.eq(self.reso),
+            voice_block.attack_rate.eq(self.attack_rate),
+            voice_block.decay_rate.eq(self.decay_rate),
+            voice_block.sustain_level.eq(self.sustain_level),
+            voice_block.release_rate.eq(self.release_rate),
+            voice_block.wt_write_addr.eq(self.wt_write_addr),
+            voice_block.wt_write_data.eq(self.wt_write_data),
+            voice_block.wt_write_en.eq(self.wt_write_en),
+        ]
 
         # Output diffuser
 
         m.submodules.diffuser = diffuser = Diffuser()
         self.diffuser = diffuser
 
-        # Stereo HPF to remove DC from any voices in 'zero cutoff'
-        # Route to audio output channels 2 & 3
+        # Voice stereo output -> expand to 4-ch for diffuser
 
-        output_hpfs = [dsp.DCBlock() for _ in range(o_channels)]
-        dsp.named_submodules(m.submodules, output_hpfs, override_name="output_hpf")
+        m.submodules.vb_merge4 = vb_merge4 = dsp.Merge(n_channels=4, sink=diffuser.i)
+        vb_merge4.wire_valid(m, [0, 1])
 
-        m.submodules.hpf_split2 = hpf_split2 = dsp.Split(n_channels=2, source=matrix_mix.o)
-        m.submodules.hpf_merge4 = hpf_merge4 = dsp.Merge(n_channels=4, sink=diffuser.i)
-        hpf_merge4.wire_valid(m, [0, 1])
+        m.submodules.vb_split2 = vb_split2 = dsp.Split(n_channels=2, source=voice_block.o)
+        wiring.connect(m, vb_split2.o[0], vb_merge4.i[2])
+        wiring.connect(m, vb_split2.o[1], vb_merge4.i[3])
 
-        for lr in [0, 1]:
-            wiring.connect(m, hpf_split2.o[lr], output_hpfs[lr].i)
-            wiring.connect(m, output_hpfs[lr].o, hpf_merge4.i[2+lr])
-
-        # Implement stereo distortion effect after diffuser.
+        # Stereo distortion after diffuser
 
         m.submodules.diffuser_split4 = diffuser_split4 = dsp.Split(
                 n_channels=4, source=diffuser.o)
         diffuser_split4.wire_ready(m, [0, 1])
 
-        m.submodules.cv_gain_split2 = cv_gain_split2 = dsp.Split(
-                n_channels=2, replicate=True, source=cv_in.o[1])
-
         def scaled_tanh(x):
             return math.tanh(3.0*x)
 
+        m.submodules.mac_server = mac_server = dsp.mac.RingMACServer()
+
         outs = []
         for lr in [0, 1]:
-            vca = dsp.VCA()
-            waveshaper = dsp.WaveShaper(lut_function=scaled_tanh)
-            vca_merge2 = dsp.Merge(n_channels=2)
+            vca = dsp.VCA(macp=mac_server.new_client())
+            waveshaper = dsp.WaveShaper(lut_function=scaled_tanh,
+                                        macp=mac_server.new_client())
             setattr(m.submodules, f"out_gainvca_{lr}", vca)
             setattr(m.submodules, f"out_waveshaper_{lr}", waveshaper)
-            setattr(m.submodules, f"out_vca_merge2_{lr}", vca_merge2)
 
-            wiring.connect(m, diffuser_split4.o[2+lr], vca_merge2.i[0])
-            wiring.connect(m, cv_gain_split2.o[lr],    vca_merge2.i[1])
-
-            dsp.connect_remap(m, vca_merge2.o, vca.i, lambda o, i : [
-                i.payload[0].eq(o.payload[0]),
-                i.payload[1].eq(self.drive << 2)
+            dsp.connect_remap(m, diffuser_split4.o[2+lr], vca.i, lambda o, i : [
+                i.payload[0].eq(o.payload<<2),
+                i.payload[1].eq(drive_val)
             ])
 
             wiring.connect(m, vca.o, waveshaper.i)
@@ -272,6 +339,27 @@ class SynthPeripheral(wiring.Component):
 
     class Reso(csr.Register, access="w"):
         value: csr.Field(csr.action.W, unsigned(16))
+
+    class AttackRate(csr.Register, access="w"):
+        value: csr.Field(csr.action.W, unsigned(16))
+
+    class DecayRate(csr.Register, access="w"):
+        value: csr.Field(csr.action.W, unsigned(16))
+
+    class SustainLevel(csr.Register, access="w"):
+        value: csr.Field(csr.action.W, unsigned(16))
+
+    class ReleaseRate(csr.Register, access="w"):
+        value: csr.Field(csr.action.W, unsigned(16))
+
+    class Lfo(csr.Register, access="w"):
+        value: csr.Field(csr.action.W, signed(16))
+
+    class WavetableAddr(csr.Register, access="w"):
+        value: csr.Field(csr.action.W, unsigned(16))
+
+    class WavetableData(csr.Register, access="w"):
+        value: csr.Field(csr.action.W, signed(16))
 
     class Voice(csr.Register, access="r"):
         note:   csr.Field(csr.action.R, unsigned(8))
@@ -301,21 +389,33 @@ class SynthPeripheral(wiring.Component):
         # Hardcoded MIDI streaming endpoint location (device specific)
         value: csr.Field(csr.action.W, unsigned(4))
 
+    class MidiChannelFilter(csr.Register, access="w"):
+        """Channel filter. 0 = no filter, 1..16 = single MIDI channel."""
+        value: csr.Field(csr.action.W, unsigned(5))
+
     def __init__(self, synth=None):
         self.synth = synth
         regs = csr.Builder(addr_width=7, data_width=8)
         voices_csr_end = 0x8+PolySynth.N_VOICES*4
-        self._drive         = regs.add("drive",         self.Drive(),        offset=0x0)
-        self._reso          = regs.add("reso",          self.Reso(),         offset=0x4)
+        self._drive         = regs.add("drive",         self.Drive(),         offset=0x0)
+        self._reso          = regs.add("reso",          self.Reso(),          offset=0x4)
         self._voices        = [regs.add(f"voices{i}",   self.Voice(),
                                offset=0x8+i*4) for i in range(PolySynth.N_VOICES)]
-        self._matrix        = regs.add("matrix",        self.Matrix(),       offset=voices_csr_end + 0x0)
-        self._matrix_busy   = regs.add("matrix_busy",   self.MatrixBusy(),   offset=voices_csr_end + 0x4)
-        self._midi_write    = regs.add("midi_write",    self.MidiWrite(),    offset=voices_csr_end + 0x8)
-        self._midi_read     = regs.add("midi_read",     self.MidiRead(),     offset=voices_csr_end + 0xC)
-        self._midi_host     = regs.add("usb_midi_host", self.UsbMidiHost(),  offset=voices_csr_end + 0x10)
-        self._midi_cfg      = regs.add("usb_midi_cfg",  self.UsbMidiCfg(),   offset=voices_csr_end + 0x14)
-        self._midi_endp     = regs.add("usb_midi_endp", self.UsbMidiCfg(),   offset=voices_csr_end + 0x18)
+        self._matrix        = regs.add("matrix",        self.Matrix(),        offset=voices_csr_end + 0x0)
+        self._matrix_busy   = regs.add("matrix_busy",   self.MatrixBusy(),    offset=voices_csr_end + 0x4)
+        self._midi_write    = regs.add("midi_write",    self.MidiWrite(),     offset=voices_csr_end + 0x8)
+        self._midi_read     = regs.add("midi_read",     self.MidiRead(),      offset=voices_csr_end + 0xC)
+        self._midi_host     = regs.add("usb_midi_host", self.UsbMidiHost(),   offset=voices_csr_end + 0x10)
+        self._midi_cfg      = regs.add("usb_midi_cfg",  self.UsbMidiCfg(),    offset=voices_csr_end + 0x14)
+        self._midi_endp     = regs.add("usb_midi_endp", self.UsbMidiCfg(),    offset=voices_csr_end + 0x18)
+        self._attack_rate   = regs.add("attack_rate",   self.AttackRate(),    offset=voices_csr_end + 0x1C)
+        self._decay_rate    = regs.add("decay_rate",    self.DecayRate(),     offset=voices_csr_end + 0x20)
+        self._sustain_level = regs.add("sustain_level", self.SustainLevel(),  offset=voices_csr_end + 0x24)
+        self._release_rate  = regs.add("release_rate",  self.ReleaseRate(),   offset=voices_csr_end + 0x28)
+        self._wt_addr       = regs.add("wt_addr",       self.WavetableAddr(), offset=voices_csr_end + 0x2C)
+        self._wt_data       = regs.add("wt_data",       self.WavetableData(), offset=voices_csr_end + 0x30)
+        self._lfo           = regs.add("lfo",           self.Lfo(),           offset=voices_csr_end + 0x34)
+        self._midi_ch_filt  = regs.add("midi_ch_filter",self.MidiChannelFilter(), offset=voices_csr_end + 0x38)
         self._bridge = csr.Bridge(regs.as_memory_map())
         super().__init__({
             "bus": In(csr.Signature(addr_width=regs.addr_width, data_width=regs.data_width)),
@@ -337,6 +437,29 @@ class SynthPeripheral(wiring.Component):
         with m.If(self._reso.f.value.w_stb):
             m.d.sync += self.synth.reso.eq(self._reso.f.value.w_data)
 
+        # ADSR parameters
+        with m.If(self._attack_rate.f.value.w_stb):
+            m.d.sync += self.synth.attack_rate.eq(self._attack_rate.f.value.w_data)
+        with m.If(self._decay_rate.f.value.w_stb):
+            m.d.sync += self.synth.decay_rate.eq(self._decay_rate.f.value.w_data)
+        with m.If(self._sustain_level.f.value.w_stb):
+            m.d.sync += self.synth.sustain_level.eq(self._sustain_level.f.value.w_data)
+        with m.If(self._release_rate.f.value.w_stb):
+            m.d.sync += self.synth.release_rate.eq(self._release_rate.f.value.w_data)
+
+        with m.If(self._lfo.f.value.w_stb):
+            m.d.sync += self.synth.lfo.as_value().eq(self._lfo.f.value.w_data)
+
+        # Wavetable write: latch address on addr write, commit on data write
+        wt_addr_reg = Signal(9)
+        with m.If(self._wt_addr.f.value.w_stb):
+            m.d.sync += wt_addr_reg.eq(self._wt_addr.f.value.w_data[:9])
+        m.d.comb += [
+            self.synth.wt_write_addr.eq(wt_addr_reg),
+            self.synth.wt_write_data.eq(self._wt_data.f.value.w_data),
+            self.synth.wt_write_en.eq(self._wt_data.f.value.w_stb),
+        ]
+
         # USB MIDI flags
         with m.If(self._midi_host.f.host.w_stb):
             m.d.sync += self.usb_midi_host.eq(self._midi_host.f.host.w_data)
@@ -349,7 +472,7 @@ class SynthPeripheral(wiring.Component):
         for i, voice in enumerate(self._voices):
             m.d.comb += [
                 voice.f.note.r_data  .eq(self.synth.voice_states[i].note),
-                voice.f.cutoff.r_data.eq(self.synth.voice_states[i].velocity_mod)
+                voice.f.cutoff.r_data.eq(self.synth.voice_cutoffs[i])
             ]
 
         # matrix coefficient update logic
@@ -370,6 +493,11 @@ class SynthPeripheral(wiring.Component):
                 self.synth.diffuser.matrix.c.valid.eq(0),
             ]
 
+        m.submodules.midi_ch_filt = midi_ch_filt = midi.MidiChannelFilter()
+        wiring.connect(m, wiring.flipped(self.i_midi), midi_ch_filt.i)
+        with m.If(self._midi_ch_filt.f.value.w_stb):
+            m.d.sync += midi_ch_filt.channel.eq(self._midi_ch_filt.f.value.w_data)
+
         # MIDI injection and arbiter between SoC MIDI and HW MIDI -> synth MIDI.
         m.submodules.soc_midi_fifo = soc_midi_fifo = SyncFIFOBuffered(
             width=24, depth=8)
@@ -377,17 +505,17 @@ class SynthPeripheral(wiring.Component):
             soc_midi_fifo.w_data.eq(self._midi_write.f.msg.w_data),
             soc_midi_fifo.w_en.eq(self._midi_write.element.w_stb),
         ]
-        wiring.connect(m, wiring.flipped(self.i_midi), self.synth.i_midi)
+        wiring.connect(m, midi_ch_filt.o, self.synth.i_midi)
         with m.If(soc_midi_fifo.r_stream.valid):
             wiring.connect(m, soc_midi_fifo.r_stream, self.synth.i_midi)
 
-        # Pipe TRS MIDI -> SoC read FIFO so SoC can inspect external
-        # MIDI traffic
+        # Pipe filtered MIDI -> SoC read FIFO so SoC can inspect external
+        # MIDI traffic.
         m.submodules.read_midi_fifo = read_midi_fifo = SyncFIFOBuffered(
             width=24, depth=8)
         m.d.comb += [
-            read_midi_fifo.w_data.eq(self.i_midi.payload),
-            read_midi_fifo.w_en.eq(self.i_midi.valid & self.i_midi.ready),
+            read_midi_fifo.w_data.eq(midi_ch_filt.o.payload),
+            read_midi_fifo.w_en.eq(midi_ch_filt.o.valid & midi_ch_filt.o.ready),
             read_midi_fifo.r_en.eq(self._midi_read.element.r_stb),
         ]
 
@@ -402,12 +530,12 @@ class SynthPeripheral(wiring.Component):
 class PolySoc(TiliquaSoc):
 
     # Used by `tiliqua_soc.py` to create a MODULE_DOCSTRING rust constant used by the 'help' page.
-    __doc__ = sys.modules[__name__].__doc__
+    module_docstring = sys.modules[__name__].__doc__
 
     # Stored in manifest and used by bootloader for brief summary of each bitstream.
     bitstream_help = BitstreamHelp(
         brief="Touch+MIDI Polysynth (8-voice)",
-        io_left=['phase cv / touch', 'touch1', 'touch2', 'touch3', 'touch4', 'touch5', 'out L', 'out R'],
+        io_left=['phase cv / touch', 'filter cv / touch', 'drive cv / touch', 'touch', 'touch', 'clk / touch', 'out L', 'out R'],
         io_right=['navigate menu', 'MIDI host', 'video out', '', '', 'TRS MIDI in']
     )
 
@@ -417,17 +545,15 @@ class PolySoc(TiliquaSoc):
         super().__init__(finalize_csr_bridge=False, **kwargs)
 
         # WARN: TiliquaSoc ends at 0x00000900
-        self.vector_periph_base = 0x00001000
-        self.synth_periph_base  = 0x00001100
+        self.vector_periph_base  = 0x00001000
+        self.synth_periph_base   = 0x00001100
 
         # Dedicated framebuffer plotter for scope peripherals (1 port: vector only for polysyn)
         self.plotter = FramebufferPlotter(
             bus_signature=self.psram_periph.bus.signature.flip(), n_ports=1)
         self.psram_periph.add_master(self.plotter.bus)
 
-        self.vector_periph = scope.VectorPeripheral(
-            fs=48000,
-            n_upsample=32)
+        self.vector_periph = scope.VectorPeripheral()
         self.csr_decoder.add(self.vector_periph.bus, addr=self.vector_periph_base, name="vector_periph")
 
         # synth controls
@@ -436,6 +562,8 @@ class PolySoc(TiliquaSoc):
 
         self.add_rust_constant(
             f"pub const N_VOICES: usize = {PolySynth.N_VOICES};\n")
+
+        self.n_upsample = 32
 
         # now we can freeze the memory map
         self.finalize_csr_bridge()
@@ -461,6 +589,8 @@ class PolySoc(TiliquaSoc):
 
         pmod0 = self.pmod0_periph.pmod
 
+        m.submodules.clock_div = clock_div = midi.MidiClockDivider()
+
         if sim.is_hw(platform):
             # Polysynth hardware MIDI sources
 
@@ -468,15 +598,17 @@ class PolySoc(TiliquaSoc):
             midi_pins = platform.request("midi")
             m.submodules.serialrx = serialrx = midi.SerialRx(
                     system_clk_hz=60e6, pins=midi_pins)
-            m.submodules.midi_decode_trs = midi_decode_trs = midi.MidiDecode()
+            m.submodules.midi_decode_trs = midi_decode_trs = midi.MidiDecodeSerial(
+                forward_rt=True)
             wiring.connect(m, serialrx.o, midi_decode_trs.i)
 
-            # USB MIDI host (experimental)
+            # USB MIDI host
             ulpi = platform.request(platform.default_usb_connection)
             m.submodules.usb = usb = USBMIDIHost(
                     bus=ulpi,
             )
-            m.submodules.midi_decode_usb = midi_decode_usb = midi.MidiDecode(usb=True)
+            m.submodules.midi_decode_usb = midi_decode_usb = midi.MidiDecodeUSB(
+                forward_rt=True)
             wiring.connect(m, usb.o_midi, midi_decode_usb.i)
 
             # Only enable VBUS if MIDI HOST is enabled.
@@ -488,17 +620,51 @@ class PolySoc(TiliquaSoc):
                 wiring.connect(m, midi_decode_trs.o, self.synth_periph.i_midi)
                 m.d.comb += vbus_o.eq(0)
 
-        # polysynth audio
+            # Route RT messages from the active MIDI source to clock divider.
+            # Drain the inactive source, connect the active one.
+            with m.If(self.synth_periph.usb_midi_host):
+                wiring.connect(m, midi_decode_usb.o_rt, clock_div.i)
+                m.d.comb += midi_decode_trs.o_rt.ready.eq(1)
+            with m.Else():
+                wiring.connect(m, midi_decode_trs.o_rt, clock_div.i)
+                m.d.comb += midi_decode_usb.o_rt.ready.eq(1)
+
+        # polysynth audio + jack detection
         wiring.connect(m, pmod0.o_cal, polysynth.i)
-        wiring.connect(m, polysynth.o, pmod0.i_cal)
+        m.d.comb += polysynth.jack.eq(pmod0.jack)
+
+        m.d.comb += [
+            pmod0.i_cal.payload[0].eq(polysynth.o.payload[0]),
+            # Channel 1 is MIDI clock square wave (0 / 0.5).
+            pmod0.i_cal.payload[1].eq(
+                Mux(clock_div.o, fixed.Const(0.5, shape=ASQ), 0)),
+            # Channel 2/3 are stereo outputs
+            pmod0.i_cal.payload[2].eq(polysynth.o.payload[2]),
+            pmod0.i_cal.payload[3].eq(polysynth.o.payload[3]),
+            pmod0.i_cal.valid.eq(polysynth.o.valid),
+            polysynth.o.ready.eq(pmod0.i_cal.ready),
+        ]
+
+        # Upsample channels 0/1 before vectorscope
+        fs = self.clock_settings.audio_clock.fs()
+        m.submodules.up_split2 = up_split2 = dsp.Split(n_channels=2, shape=PSQ)
+        m.submodules.up_merge4 = up_merge4 = dsp.Merge(n_channels=4, shape=PSQ)
+        for ch in range(2):
+            r = dsp.Resample(fs_in=fs, n_up=self.n_upsample, m_down=1, shape=PSQ)
+            setattr(m.submodules, f"resample{ch}", r)
+            wiring.connect(m, up_split2.o[ch], r.i)
+            wiring.connect(m, r.o, up_merge4.i[ch])
+        for ch in range(2, 4):
+            m.d.comb += up_merge4.i[ch].valid.eq(1)
 
         with m.If(self.vector_periph.soc_en):
-            # polysynth out -> vectorscope TODO use true split
+            # polysynth out -> upsample -> vectorscope
             m.d.comb += [
-                self.vector_periph.i.valid.eq(polysynth.o.valid),
-                self.vector_periph.i.payload[0].eq(polysynth.o.payload[2]),
-                self.vector_periph.i.payload[1].eq(polysynth.o.payload[3]),
+                up_split2.i.valid.eq(polysynth.o.valid),
+                up_split2.i.payload[0].eq(polysynth.o.payload[2]),
+                up_split2.i.payload[1].eq(polysynth.o.payload[3]),
             ]
+            wiring.connect(m, up_merge4.o, self.vector_periph.i)
 
         return m
 

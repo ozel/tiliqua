@@ -277,7 +277,8 @@ class DSPTests(unittest.TestCase):
             result = await stream.get(ctx, matrix.o)
             self.assertAlmostEqual(result[0].as_float(),  0.3, places=4)
             self.assertAlmostEqual(result[1].as_float(), -0.4, places=4)
-            self.assertAlmostEqual(result[2].as_float(), -0.9, places=4)
+            # 1.1 -> saturates to 1
+            self.assertAlmostEqual(result[2].as_float(),  1.0, places=4)
             self.assertAlmostEqual(result[3].as_float(), -0.8, places=4)
 
         sim = Simulator(matrix)
@@ -412,6 +413,29 @@ class DSPTests(unittest.TestCase):
         sim.add_clock(1e-6)
         sim.add_testbench(testbench)
         with sim.write_vcd(vcd_file=open("test_dcblock.vcd", "w")):
+            sim.run()
+
+    def test_onepole(self):
+
+        dut = dsp.OnePole()
+        target = 0.5
+
+        async def stimulus(ctx):
+            x = fixed.Const(target, shape=ASQ)
+            while True:
+                await stream.put(ctx, dut.i, x)
+
+        async def testbench(ctx):
+            ctx.set(dut.shift, 4)
+            for n in range(0, 256):
+                y = await stream.get(ctx, dut.o)
+            self.assertAlmostEqual(y.as_float(), target, places=2)
+
+        sim = Simulator(dut)
+        sim.add_clock(1e-6)
+        sim.add_testbench(stimulus, background=True)
+        sim.add_testbench(testbench)
+        with sim.write_vcd(vcd_file=open("test_onepole.vcd", "w")):
             sim.run()
 
     def test_stream_arbiter(self):

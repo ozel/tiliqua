@@ -244,7 +244,7 @@ class SIDPeripheral(wiring.Component):
 class SIDSoc(TiliquaSoc):
 
     # Used by `tiliqua_soc.py` to create a MODULE_DOCSTRING rust constant used by the 'help' page.
-    __doc__ = sys.modules[__name__].__doc__
+    module_docstring = sys.modules[__name__].__doc__
 
     # Stored in manifest and used by bootloader for brief summary of each bitstream.
     bitstream_help = BitstreamHelp(
@@ -269,7 +269,8 @@ class SIDSoc(TiliquaSoc):
         self.psram_periph.add_master(self.plotter.bus)
 
         # Add scope peripheral
-        self.scope_periph = scope.ScopePeripheral()
+        self.scope_periph = scope.ScopePeripheral(
+            fs=self.clock_settings.audio_clock.fs())
         self.csr_decoder.add(self.scope_periph.bus, addr=0x1100, name="scope_periph")
 
         # Note: Arbiter is now built into the FramebufferPlotter

@@ -235,7 +235,7 @@ where
     }
     Text::with_alignment(
         &startup_report,
-        Point::new((h_active/2) as i32, (v_active/2+130) as i32 + ot),
+        Point::new((h_active/2) as i32, (v_active/2-20) as i32 + ot),
         norm,
         Alignment::Center,
     )
@@ -849,7 +849,7 @@ fn main() -> ! {
         let mut logo_coord_ix = 0u32;
         let mut rng = fastrand::Rng::with_seed(0);
 
-        persist.set_persist(256);
+        persist.set_persistence(64);
 
         let stroke = PrimitiveStyleBuilder::new()
             .stroke_color(HI8::new(0, 10))

@@ -13,5 +13,10 @@ tiliqua_hal::impl_polysynth! {
     N_VOICES
 }
 
+hal::impl_vector! {
+    Vector0: pac::VECTOR_PERIPH,
+}
+
 pub mod handlers;
 pub mod options;
+pub mod wavetable;

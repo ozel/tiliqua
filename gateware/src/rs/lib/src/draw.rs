@@ -176,6 +176,132 @@ where
     Ok(())
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum AdsrPhase {
+    Attack,
+    Decay,
+    Sustain,
+    Release,
+}
+
+pub fn draw_adsr<D>(d: &mut D, x: u32, y: u32, width: u32, height: u32,
+                    attack: u16, decay: u16, sustain: u16, release: u16,
+                    hue: u8, highlight: Option<AdsrPhase>) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = HI8>,
+{
+    let font_dim = MonoTextStyle::new(&FONT_9X15, HI8::new(hue, 10));
+    let font_bright = MonoTextStyle::new(&FONT_9X15_BOLD, HI8::new(hue, 15));
+
+    // Convert UI values (0..32768) to milliseconds (1..2000)
+    let a_ms = 1.0f32 + (attack as f32 / 32768.0f32) * 1999.0f32;
+    let d_ms = 1.0f32 + (decay as f32 / 32768.0f32) * 1999.0f32;
+    let s_ms = 1000.0f32; // fixed sustain section
+    let r_ms = 1.0f32 + (release as f32 / 32768.0f32) * 1999.0f32;
+
+    let total_ms = a_ms + d_ms + s_ms + r_ms;
+    let w = width as f32;
+
+    let a_w = (a_ms / total_ms * w) as i32;
+    let d_w = (d_ms / total_ms * w) as i32;
+    let s_w = (s_ms / total_ms * w) as i32;
+    let r_w = width as i32 - a_w - d_w - s_w; // remainder avoids rounding gaps
+
+    let s_level = (sustain as u32 * height / 32768) as i32;
+    let h = height as i32;
+    let x = x as i32;
+    let y = y as i32;
+
+    // Envelope vertices
+    let p0 = Point::new(x, y + h);
+    let p1 = Point::new(x + a_w, y);
+    let p2 = Point::new(x + a_w + d_w, y + h - s_level);
+    let p3 = Point::new(x + a_w + d_w + s_w, y + h - s_level);
+    let p4 = Point::new(x + a_w + d_w + s_w + r_w, y + h);
+
+    let stroke = PrimitiveStyleBuilder::new()
+        .stroke_color(HI8::new(hue, 15))
+        .stroke_width(1)
+        .build();
+
+    let stroke_dim = PrimitiveStyleBuilder::new()
+        .stroke_color(HI8::new(hue, 6))
+        .stroke_width(1)
+        .build();
+
+    // Baseline
+    Line::new(Point::new(x, y + h), Point::new(x + width as i32, y + h))
+        .into_styled(stroke_dim).draw(d)?;
+
+    // Section separators
+    for sep_x in [p1.x, p2.x, p3.x] {
+        Line::new(Point::new(sep_x, y), Point::new(sep_x, y + h))
+            .into_styled(stroke_dim).draw(d)?;
+    }
+
+    // Envelope lines
+    Line::new(p0, p1).into_styled(stroke).draw(d)?;
+    Line::new(p1, p2).into_styled(stroke).draw(d)?;
+    Line::new(p2, p3).into_styled(stroke).draw(d)?;
+    Line::new(p3, p4).into_styled(stroke).draw(d)?;
+
+    // Section labels
+    let label_y = y + h + 14;
+    let font = |phase| if highlight == Some(phase) { font_bright } else { font_dim };
+    Text::with_alignment("A", Point::new(x + a_w / 2, label_y),
+        font(AdsrPhase::Attack), Alignment::Center).draw(d)?;
+    Text::with_alignment("D", Point::new(x + a_w + d_w / 2, label_y),
+        font(AdsrPhase::Decay), Alignment::Center).draw(d)?;
+    Text::with_alignment("S", Point::new(x + a_w + d_w + s_w / 2, label_y),
+        font(AdsrPhase::Sustain), Alignment::Center).draw(d)?;
+    Text::with_alignment("R", Point::new(x + a_w + d_w + s_w + r_w / 2, label_y),
+        font(AdsrPhase::Release), Alignment::Center).draw(d)?;
+
+    Ok(())
+}
+
+pub fn draw_waveform_preview<D>(d: &mut D, x: u32, y: u32, width: u32, height: u32,
+                                hue: u8, samples: &[i16]) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = HI8>,
+{
+    let stroke = PrimitiveStyleBuilder::new()
+        .stroke_color(HI8::new(hue, 15))
+        .stroke_width(1)
+        .build();
+
+    let stroke_dim = PrimitiveStyleBuilder::new()
+        .stroke_color(HI8::new(hue, 6))
+        .stroke_width(1)
+        .build();
+
+    let h = height as i32;
+    let half_h = h / 2;
+    let x = x as i32;
+    let y = y as i32;
+    let center_y = y + half_h;
+
+    // Baseline
+    Line::new(Point::new(x, center_y), Point::new(x + width as i32, center_y))
+        .into_styled(stroke_dim).draw(d)?;
+
+    let n = samples.len();
+    if n < 2 {
+        return Ok(());
+    }
+
+    for i in 1..n {
+        let x0 = x + (i - 1) as i32 * width as i32 / (n - 1) as i32;
+        let x1 = x + i as i32 * width as i32 / (n - 1) as i32;
+        let y0 = center_y - (samples[i - 1] as i32 * half_h / 32767);
+        let y1 = center_y - (samples[i] as i32 * half_h / 32767);
+        Line::new(Point::new(x0, y0), Point::new(x1, y1))
+            .into_styled(stroke).draw(d)?;
+    }
+
+    Ok(())
+}
+
 pub fn draw_boot_logo<D>(d: &mut D, sx: i32, sy: i32, ix: u32) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = HI8>,
@@ -380,7 +506,7 @@ where
     Ok(())
 }
 
-pub fn draw_cal<D>(d: &mut D, x: u32, y: u32, hue: u8, dac: &[i16; 4], adc: &[i16; 4]) -> Result<(), D::Error>
+pub fn draw_cal<D>(d: &mut D, x: u32, y: u32, hue: u8, dac: &[i32; 4], adc: &[i32; 4], counts_per_v: i32) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = HI8>,
 {
@@ -411,14 +537,15 @@ where
         line(d, 0, ch*spacing+s_y/2, 0, s_y+ch*spacing, false);
         line(d, width, ch*spacing+s_y/2, width, s_y+ch*spacing, false);
         line(d, width/2, ch*spacing+s_y-spacing/2, width/2, s_y+ch*spacing, false);
-        let delta = (adc[ch as usize] - dac[ch as usize]) / 4;
-        if delta.abs() < (width/2) as i16 {
-            let pos = (delta + (width/2) as i16) as u32;
+        let counts_per_mv = counts_per_v / 1000;
+        let delta = (adc[ch as usize] - dac[ch as usize]) / counts_per_mv;
+        if delta.abs() < (width/2) as i32 {
+            let pos = (delta + (width/2) as i32) as u32;
             line(d, pos, ch*spacing+s_y-spacing/4, pos, s_y+ch*spacing, true);
         }
 
         let mut adc_text: String<8> = String::new();
-        write!(adc_text, "{}", adc[ch as usize]/4).ok();
+        write!(adc_text, "{}", adc[ch as usize]/counts_per_mv).ok();
         Text::with_alignment(
             &adc_text,
             Point::new((x-10) as i32, (y+(ch+1)*spacing-3) as i32),
@@ -427,7 +554,7 @@ where
         ).draw(d)?;
 
         let mut dac_text: String<8> = String::new();
-        write!(dac_text, "{}", dac[ch as usize]/4).ok();
+        write!(dac_text, "{}", dac[ch as usize]/counts_per_mv).ok();
         Text::with_alignment(
             &dac_text,
             Point::new((x+width+10) as i32, (y+(ch+1)*spacing-3) as i32),
@@ -458,7 +585,8 @@ pub fn draw_cal_constants<D>(
     adc_scale: &[i32; 4],
     adc_zero:  &[i32; 4],
     dac_scale: &[i32; 4],
-    dac_zero:  &[i32; 4]
+    dac_zero:  &[i32; 4],
+    f_bits: u8,
     ) -> Result<(), D::Error>
 where
     D: DrawTarget<Color = HI8>,
@@ -467,14 +595,15 @@ where
 
     let spacing = 30;
     let width   = 256;
+    let divisor = (1u32 << f_bits) as f32;
 
     for ch in 0..4 {
         let mut s: String<32> = String::new();
         write!(s, "O{} = {:.4} * o{} + {:.4}",
               ch,
-              dac_scale[ch as usize] as f32 / 32768f32,
+              dac_scale[ch as usize] as f32 / divisor,
               ch,
-              dac_zero[ch as usize] as f32 / 32768f32).ok();
+              dac_zero[ch as usize] as f32 / divisor).ok();
         Text::with_alignment(
             &s,
             Point::new((x+width/2+20) as i32, (y+(ch+1)*spacing-3) as i32),
@@ -487,9 +616,9 @@ where
         let mut s: String<32> = String::new();
         write!(s, "i{} = {:.4} * I{} + {:.4}",
               ch,
-              adc_scale[ch as usize] as f32 / 32768f32,
+              adc_scale[ch as usize] as f32 / divisor,
               ch,
-              adc_zero[ch as usize] as f32 / 32768f32).ok();
+              adc_zero[ch as usize] as f32 / divisor).ok();
         Text::with_alignment(
             &s,
             Point::new((x+width/2-20) as i32, (y+(ch+1)*spacing-3) as i32),
@@ -766,8 +895,7 @@ where
 // Helper to draw waveform peaks at a certain position given
 // an array of samples. No effort made to compute absolute magnitude
 // based on adjacent peaks, but this seems to look fine.
-// Currently only used in sampler bitstream.
-pub fn draw_waveform<D>(
+pub fn draw_waveform_peaks<D>(
     d: &mut D,
     x: u32, y: u32,
     width: u32, height: u32,
@@ -792,6 +920,40 @@ where
         Line::new(
             Point::new(x_pos as i32, y_top),
             Point::new(x_pos as i32, y_bot)
+        ).into_styled(stroke).draw(d)?;
+    }
+
+    Ok(())
+}
+
+// Like `draw_waveform`, but connecting lines instead of 'peak' bars.
+// This is more useful for plotting CV. It's currently only used in the
+// sampler bitstream.
+pub fn draw_waveform_lines<D>(
+    d: &mut D,
+    x: u32, y: u32,
+    width: u32, height: u32,
+    hue: u8,
+    samples: &[i16],
+) -> Result<(), D::Error>
+where
+    D: DrawTarget<Color = HI8>,
+{
+    let stroke = PrimitiveStyleBuilder::new()
+        .stroke_color(HI8::new(hue, 12))
+        .stroke_width(1)
+        .build();
+    let center_y = y as i32 + height as i32 / 2;
+    let half_height = height as i32 / 2;
+    let sample_width = if samples.len() > 0 { width / samples.len() as u32 } else { 1 };
+    for i in 1..samples.len() {
+        let x0 = x as i32 + ((i - 1) as i32 * sample_width as i32);
+        let x1 = x as i32 + (i as i32 * sample_width as i32);
+        let y0 = center_y - (samples[i - 1] as i32 * half_height) / 32768;
+        let y1 = center_y - (samples[i] as i32 * half_height) / 32768;
+        Line::new(
+            Point::new(x0, y0),
+            Point::new(x1, y1)
         ).into_styled(stroke).draw(d)?;
     }
 
@@ -1116,13 +1278,13 @@ mod tests {
 
         draw_cal(&mut disp, H_ACTIVE/2-128, V_ACTIVE/2-128, 0,
                  &[4096, 4096, 4096, 4096],
-                 &[4000, 4120, 4090, 4000]).ok();
+                 &[4000, 4120, 4090, 4000], 4000).ok();
         draw_cal_constants(&mut disp, H_ACTIVE/2-128, V_ACTIVE/2+64, 0,
                  &[4096, 4096, 4096, 4096],
                  &[4000, 4120, 4090, 4000],
                  &[4096, 4096, 4096, 4096],
-                 &[4000, 4120, 4090, 4000]
-                 ).ok();
+                 &[4000, 4120, 4090, 4000],
+                 15).ok();
 
         disp.img.save("draw_cal.png").unwrap();
     }
